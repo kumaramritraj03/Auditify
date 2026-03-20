@@ -1,6 +1,3 @@
-
-
-
 # =========================================================
 # 🔷 1. CLARIFICATION ENGINE PROMPT (STRICT)
 # =========================================================
@@ -110,7 +107,7 @@ OUTPUT FORMAT:
 
 
 # =========================================================
-# 🔷 4. CODE GENERATION PROMPT
+# 🔷 4. CODE GENERATION PROMPT (DuckDB REQUIRED)
 # =========================================================
 
 CODE_GENERATION_PROMPT = """
@@ -121,23 +118,22 @@ Your responsibility is to generate SAFE, EXECUTABLE Python code.
 STRICT RULES:
 1. ALL computations MUST be done in code.
 2. DO NOT use LLM for calculations.
-3. Use pandas or duckdb.
-4. Handle large datasets safely.
+3. CRITICAL: You MUST use DuckDB for all data processing and SQL execution to ensure large data safety. Do NOT use Pandas for heavy computation or joins.
+4. Utilize DuckDB SQL pushdown and chunking if necessary.
 5. Validate columns before usage.
 6. Handle missing columns gracefully.
 7. Ensure type conversions.
-8. Avoid memory-heavy operations.
-9. Output MUST define a variable named `result`.
+8. Output MUST define a final variable named `result` containing the output data or summary.
 
 INPUT:
 Instructions:
 {instructions}
 
 TASK:
-Generate production-safe Python code.
+Generate production-safe Python code using the DuckDB library.
 
 OUTPUT:
-Only Python code. No explanations.
+Only Python code. No explanations. No markdown code blocks (e.g., do not wrap in ```python).
 """
 
 
@@ -169,11 +165,11 @@ Predict:
 - confidence score
 
 OUTPUT FORMAT (STRICT JSON):
-{
+{{
   "predicted_type": "...",
   "predicted_description": "...",
   "confidence": 0.0
-}
+}}
 """
 
 
@@ -202,12 +198,12 @@ Identify:
 - key fields
 
 OUTPUT FORMAT:
-{
+{{
   "document_type": "...",
   "summary": "...",
   "detected_fields": ["...", "..."],
   "confidence": 0.0
-}
+}}
 """
 
 
@@ -236,13 +232,13 @@ TASK:
 Map semantic fields to columns.
 
 OUTPUT FORMAT:
-{
-  "mappings": {
+{{
+  "mappings": {{
     "field_1": "column_name",
     "field_2": ["candidate1", "candidate2"]
-  },
+  }},
   "missing_fields": ["field_x"]
-}
+}}
 """
 
 
@@ -285,8 +281,8 @@ Extract:
 - reusable logic components
 
 OUTPUT FORMAT:
-{
+{{
   "semantic_requirements": ["..."],
   "logic_blocks": ["..."]
-}
+}}
 """
