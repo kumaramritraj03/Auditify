@@ -26,7 +26,6 @@ def run_auditify_orchestration(file_path: str, user_query: str):
     print("[SUCCESS] Metadata Extracted.")
 
     # 2. INITIALIZE CONTEXT
-    # This context aligns with the RUNTIME CONTEXT in the Orchestrator Prompt
     context = {
         "current_stage": "START",
         "user_query": user_query,
@@ -40,7 +39,6 @@ def run_auditify_orchestration(file_path: str, user_query: str):
     }
 
     # 3. ORCHESTRATION LOOP
-    # The loop continues until the Orchestrator hits a terminal state
     while context["current_stage"] not in ["COMPLETED", "INFORMATIONAL"]:
         print(f"\n[ORCHESTRATOR] Current Stage: {context['current_stage']}")
         
@@ -55,45 +53,68 @@ def run_auditify_orchestration(file_path: str, user_query: str):
         message = step_result.get("message")
 
         if stage == "CLARIFICATION":
-            print(f"[ACTION] Clarifications Needed:\n{json.dumps(data, indent=2)}")
-            # In a real UI, you'd collect these from the user
-            # Simulation: Providing empty answers or default mapping
-            print("--- Simulating User Input for Clarifications ---")
-            context["clarifications"] = { "noted": "proceeding with defaults" }
+            print(f"\n[ACTION] Clarifications Needed:")
+            user_answers = {}
+            
+            # Ask the user for input for each clarification question
+            if isinstance(data, list):
+                for idx, question in enumerate(data):
+                    print(f"\nQ{idx+1}: {question}")
+                    ans = input("Your Answer: ")
+                    user_answers[question] = ans
+            else:
+                print(f"\nQ: {data}")
+                ans = input("Your Answer: ")
+                user_answers[str(data)] = ans
+                
+            context["clarifications"] = user_answers
             context["current_stage"] = "AWAITING_PLAN"
 
         elif stage == "PLANNING":
-            print(f"[ACTION] Proposed Plan:\n{data}")
-            print(f"Message: {message}")
-            # Simulation: User confirms the plan
-            context["plan"] = data
-            context["is_confirmed"] = True
-            context["current_stage"] = "PLAN_CONFIRMED"
+            print(f"\n[ACTION] Proposed Plan:\n{data}")
+            print(f"\nMessage: {message}")
+            
+            # Ask the user to approve the plan
+            ans = input("\nDo you approve this plan? (yes/no): ")
+            if ans.lower().strip() in ['y', 'yes']:
+                context["plan"] = data
+                context["is_confirmed"] = True
+                context["current_stage"] = "PLAN_CONFIRMED"
+            else:
+                print("[ABORT] Plan rejected by user. Exiting.")
+                break
 
         elif stage == "CODE_GENERATED":
-            print("[SUCCESS] Code generated and instructions ready.")
-            context["code"] = data
-            context["current_stage"] = "READY_TO_EXECUTE"
+            print("\n[SUCCESS] Code generated and instructions ready:\n")
+            print(data) # Print the actual code to the CLI
+            
+            # Ask the user before executing raw code
+            ans = input("\nExecute this code? (yes/no): ")
+            if ans.lower().strip() in ['y', 'yes']:
+                context["code"] = data
+                context["current_stage"] = "READY_TO_EXECUTE"
+            else:
+                print("[ABORT] Execution cancelled by user. Exiting.")
+                break
 
         elif stage == "EXECUTION_COMPLETE":
-            print("[SUCCESS] Execution Final Result:")
+            print("\n[SUCCESS] Execution Final Result:")
             print(json.dumps(data, indent=2))
             context["result"] = data
             context["current_stage"] = "COMPLETED"
             print(f"\n[FINISH] {message}")
 
         elif stage == "INFORMATIONAL":
-            print(f"[INFO] Response: {data}")
+            print(f"\n[INFO] Response: {data}")
             context["current_stage"] = "INFORMATIONAL"
         
         else:
-            print(f"[UNKNOWN STAGE] Ending loop to prevent infinite recursion.")
+            print(f"\n[UNKNOWN STAGE] Ending loop to prevent infinite recursion.")
             break
 
 if __name__ == "__main__":
     # Run the client
     run_auditify_orchestration(
-        # Notice the 'r' right before the opening quote!
         file_path=r"C:\Users\Kumar Amritraj\Downloads\sales_transactions.xlsx",
         user_query="Calculate the total amount spent per vendor."
     )
