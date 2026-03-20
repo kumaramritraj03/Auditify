@@ -18,21 +18,32 @@ class QueryRequest(BaseModel):
     query: str
     metadata: List[Dict[str, Any]]
 
+# --- NEW GRANULAR REQUEST MODELS ---
+class PlanRequest(BaseModel):
+    query: str
+    metadata: List[Dict[str, Any]]
+
+class CodeRequest(BaseModel):
+    plan: str
+
+class ExecuteCodeRequest(BaseModel):
+    code: str
+
+# --- RESPONSES ---
 class PlanResponse(BaseModel):
     plan: str
 
 class CodeResponse(BaseModel):
     code: str
+    instructions: str
+    semantics: dict
 
 class ExecutionResponse(BaseModel):
     result: Any
     summary: str
     error: Optional[str] = None
 
-# ==========================================
-# 🔷 NEW: WORKFLOW MODELS (PRD FEATURE 1 & 2)
-# ==========================================
-
+# --- WORKFLOW MODELS ---
 class WorkflowSaveRequest(BaseModel):
     workflow_id: str
     code: str

@@ -3,12 +3,21 @@ import uuid
 import io
 
 from metadata import process_csv_stream, process_excel_file
-from orchestrator import handle_query, confirm_and_execute, map_and_execute_workflow
-from models import QueryRequest, WorkflowSaveRequest, WorkflowRunRequest
+from orchestrator import (
+    handle_query, 
+    confirm_and_execute, 
+    map_and_execute_workflow,
+    create_execution_plan,
+    create_executable_code,
+    run_generated_code
+)
+from models import (
+    QueryRequest, PlanRequest, CodeRequest, ExecuteCodeRequest,
+    WorkflowSaveRequest, WorkflowRunRequest
+)
 
 app = FastAPI()
 
-# In-memory mock database for saved workflows
 WORKFLOW_DB = {}
 
 # =========================================================
@@ -20,7 +29,6 @@ async def upload_file(file: UploadFile):
     filename = file.filename.lower()
     
     if filename.endswith(".csv"):
-        # PRD Constraint: Streaming early stop for CSVs (Read only first 6 rows)
         sampled_lines = []
         try:
             for _ in range(6):
@@ -29,7 +37,6 @@ async def upload_file(file: UploadFile):
                     break
                 sampled_lines.append(line)
         finally:
-            # Close the stream immediately to prevent loading the full file into memory
             file.file.close()
             
         if not sampled_lines:
@@ -37,25 +44,19 @@ async def upload_file(file: UploadFile):
 
         sample_bytes = b"".join(sampled_lines)
         sample_stream = io.BytesIO(sample_bytes)
-        
         metadata = process_csv_stream(sample_stream)
         file_type = "csv"
 
     elif filename.endswith((".xls", ".xlsx")):
-        # PRD Constraint: Support Excel. 
         try:
-            # FIX: Read into io.BytesIO to avoid the 'SpooledTemporaryFile' missing 'seekable' attribute error
             excel_bytes = file.file.read()
             excel_stream = io.BytesIO(excel_bytes)
-            
             metadata = process_excel_file(excel_stream)
         finally:
             file.file.close()
-            
         file_type = "excel"
-        
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file format. Please upload CSV or Excel.")
+        raise HTTPException(status_code=400, detail="Unsupported file format.")
 
     return {
         "source_id": file_id,
@@ -65,12 +66,25 @@ async def upload_file(file: UploadFile):
     }
 
 # =========================================================
-# 🔷 2. FLOW 1: NEW QUERY
+# 🔷 2. FLOW 1: NEW QUERY & GRANULAR ENGINES
 # =========================================================
 @app.post("/query")
 def query_endpoint(request: QueryRequest):
     return handle_query(request.query, request.metadata)
 
+@app.post("/plan")
+def generate_plan_endpoint(request: PlanRequest):
+    return create_execution_plan(request.query, request.metadata)
+
+@app.post("/code")
+def generate_code_endpoint(request: CodeRequest):
+    return create_executable_code(request.plan)
+
+@app.post("/execute_code")
+def run_code_endpoint(request: ExecuteCodeRequest):
+    return run_generated_code(request.code)
+
+# (Legacy bundled execution shortcut)
 @app.post("/execute")
 def execute_endpoint(request: QueryRequest):
     return confirm_and_execute(request.query, request.metadata)
@@ -89,5 +103,4 @@ def run_workflow(request: WorkflowRunRequest):
         raise HTTPException(status_code=404, detail="Workflow not found")
         
     saved_workflow = WORKFLOW_DB[request.workflow_id]
-    result = map_and_execute_workflow(saved_workflow, request.new_metadata)
-    return result
+    return map_and_execute_workflow(saved_workflow, request.new_metadata)
