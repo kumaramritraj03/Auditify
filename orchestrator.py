@@ -1,91 +1,60 @@
+import json
 from agents import (
-    classify_query,
+    run_orchestrator,
     generate_clarifications,
     generate_plan,
     generate_code_instructions,
     generate_code,
-    generate_mapping,
-    extract_workflow_semantics
+    classify_query
 )
 from execution import execute_code
 
-# =========================================================
-# 🔷 FLOW 1: NEW QUERY ENTRY
-# =========================================================
-
-def handle_query(query, metadata):
-    query_type = classify_query(query)
-
-    if "informational" in query_type.lower():
+def handle_query_v2(context: dict):
+    """
+    Orchestrates the flow based on the current context state.
+    This replaces the old handle_query linear logic.
+    """
+    # 1. Ask the Orchestrator what to do next
+    orchestrator_decision = run_orchestrator(context)
+    
+    # 2. Execute based on Orchestrator's pipeline instruction
+    # Note: In a real system, we parse JSON tools. Here we align with the prompt pipeline.
+    
+    if "generate_clarifications" in orchestrator_decision:
+        questions = generate_clarifications(context["user_query"], context["metadata"])
         return {
-            "type": "informational",
-            "message": "This query does not require execution."
+            "stage": "CLARIFICATION",
+            "data": questions,
+            "message": "Please answer these clarifications to proceed."
         }
 
-    clarifications = generate_clarifications(query, metadata)
+    if "generate_plan" in orchestrator_decision:
+        plan = generate_plan(context["user_query"], context["metadata"], context.get("clarifications", {}))
+        return {
+            "stage": "PLANNING",
+            "data": plan,
+            "message": "Would you like to proceed with this plan?"
+        }
+
+    if "generate_code" in orchestrator_decision:
+        instructions = generate_code_instructions(context["plan"])
+        code = generate_code(instructions)
+        return {
+            "stage": "CODE_GENERATED",
+            "data": code,
+            "message": "Code is ready for execution."
+        }
+
+    if "execute_code" in orchestrator_decision:
+        result = execute_code(context["code"])
+        return {
+            "stage": "EXECUTION_COMPLETE",
+            "data": result,
+            "message": "Process finished. Would you like to save this workflow?"
+        }
+
+    # Fallback: return the LLM's direct response (Informational queries)
     return {
-        "type": "analytical",
-        "stage": "clarification",
-        "clarifications": clarifications
-    }
-
-# =========================================================
-# 🔷 NEW GRANULAR ORCHESTRATION (PRD Steps 4, 6, 7)
-# =========================================================
-
-def create_execution_plan(query, metadata):
-    """PRD Step 4: Generate Plan"""
-    plan = generate_plan(query, metadata)
-    return {"plan": plan}
-
-def create_executable_code(plan):
-    """PRD Step 6: Generate Code & Instructions"""
-    instructions = generate_code_instructions(plan)
-    code = generate_code(instructions)
-    semantics = extract_workflow_semantics(plan)
-    
-    return {
-        "instructions": instructions,
-        "code": code,
-        "semantics": semantics
-    }
-
-def run_generated_code(code):
-    """PRD Step 7: Code Execution"""
-    execution_result = execute_code(code)
-    return execution_result
-
-# =========================================================
-# 🔷 LEGACY / BUNDLED EXECUTION (Optional shortcut)
-# =========================================================
-def confirm_and_execute(query, metadata):
-    plan = generate_plan(query, metadata)
-    instructions = generate_code_instructions(plan)
-    code = generate_code(instructions)
-    semantics = extract_workflow_semantics(plan)
-    execution_result = execute_code(code)
-
-    return {
-        "plan": plan,
-        "instructions": instructions,
-        "code": code,
-        "semantics": semantics,
-        "execution": execution_result
-    }
-
-# =========================================================
-# 🔷 FLOW 2: RUN EXISTING WORKFLOW
-# =========================================================
-
-def map_and_execute_workflow(saved_workflow: dict, new_metadata: list):
-    required_fields = saved_workflow.get("semantic_requirements", [])
-    available_columns = [col["name"] for col in new_metadata]
-    
-    mapping_result = generate_mapping(str(required_fields), str(available_columns))
-    execution_result = execute_code(saved_workflow["code"])
-    
-    return {
-        "stage": "workflow_execution",
-        "mappings_applied": mapping_result,
-        "execution": execution_result
+        "stage": "INFORMATIONAL",
+        "data": orchestrator_decision
     }
