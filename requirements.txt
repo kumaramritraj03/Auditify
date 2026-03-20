@@ -1,0 +1,23 @@
+# FastAPI server
+fastapi==0.110.0
+uvicorn==0.29.0
+
+# Vertex AI (Gemini)
+google-cloud-aiplatform==1.48.0
+vertexai==1.48.0
+
+# Data processing
+pandas==2.2.2
+numpy==1.26.4
+
+# File handling
+python-multipart==0.0.9
+
+# Optional but recommended (large data handling)
+duckdb==0.10.2
+
+# Validation & schemas
+pydantic==2.6.4
+
+# Utilities
+python-dotenv==1.0.1
