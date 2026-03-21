@@ -19,5 +19,8 @@ duckdb==0.10.2
 # Validation & schemas
 pydantic==2.6.4
 
+# Frontend
+streamlit==1.45.0
+
 # Utilities
 python-dotenv==1.0.1

@@ -9,6 +9,10 @@ googleCred.json
 # ---------------------------------------------------
 # Ignore the temporary uploads folder created by FastAPI
 uploads/
+workflows/
+
+# Ignore generated code scripts from execution engine
+generated_scripts/
 
 # ---------------------------------------------------
 # 🐍 PYTHON & VIRTUAL ENVIRONMENTS
