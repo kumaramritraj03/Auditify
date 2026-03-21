@@ -19,7 +19,7 @@ from metadata import extract_structured_metadata, process_pdf_file
 from orchestrator import handle_query_v2
 from workflow import fetch_workflows, get_workflow, save_workflow
 from execution import execute_code, execute_code_repl
-from agents import extract_workflow_semantics, map_fields
+from agents import extract_workflow_semantics, map_fields, infer_file_roles
 from file_registry import register_file, get_all_files
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +59,12 @@ def _init_state():
         "workflow_mappings": {},
         # Workflow execution — selected file override
         "workflow_file_path": "",   # file_path chosen for current workflow run
+        # Multi-file registry: {alias -> absolute_path}
+        "file_registry": {},        # built on upload; passed to orchestrator
+        # Per-workflow file mapping: {dependency_alias -> absolute_path}
+        "workflow_file_registry": {},
+        # Columns extracted from workflow-selected files (for mapping stage)
+        "_wf_combined_columns": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -162,6 +168,19 @@ with st.sidebar:
     st.title("Auditify")
     st.caption("Data-Driven Audit & Analysis Platform")
     st.divider()
+
+    # ── Quick access: Run saved workflow without uploading ────
+    _sidebar_workflows = fetch_workflows()
+    if _sidebar_workflows:
+        if st.button("Run Existing Workflow", use_container_width=True, type="primary"):
+            st.session_state.workflows = _sidebar_workflows
+            st.session_state.selected_workflow = None
+            st.session_state.stage = "SELECT_WORKFLOW"
+            st.session_state.messages = []
+            add_message("system", "Select a saved workflow to run.")
+            st.rerun()
+        st.caption(f"{len(_sidebar_workflows)} saved workflow(s) available")
+        st.divider()
 
     # ── File Upload (supports multiple files) ────────────────
     st.subheader("Upload Data")
@@ -273,6 +292,20 @@ with st.sidebar:
                     merged_summary = first["result"].get("data_summary", {})
                     merged_edge_cases = first["result"].get("edge_cases", {})
 
+                # Build file_registry: alias = stem of filename, de-duplicated
+                built_registry = {}
+                for item in processed:
+                    stem = os.path.splitext(item["name"])[0].lower().replace(" ", "_")
+                    alias = stem
+                    counter = 2
+                    while alias in built_registry:
+                        alias = f"{stem}_{counter}"
+                        counter += 1
+                    built_registry[alias] = item["path"]
+                # Also store "default" → primary for backward compat
+                if primary_path:
+                    built_registry["default"] = primary_path
+
                 print(f"[STAGE] UPLOAD | [FUNCTION] Metadata extraction complete | {len(all_columns)} columns from {len(all_sources)} sources")
                 st.session_state.metadata = all_columns
                 st.session_state.data_summary = merged_summary
@@ -281,6 +314,7 @@ with st.sidebar:
                 st.session_state.file_type = primary_type
                 st.session_state.source_id = primary_id
                 st.session_state.sources = all_sources
+                st.session_state.file_registry = built_registry
                 st.session_state.uploaded = True
                 st.session_state.stage = "QUERY"
                 st.session_state.messages = []
@@ -402,8 +436,18 @@ with st.sidebar:
                     })
                 st.dataframe(pd.DataFrame(col_data), use_container_width=True, hide_index=True)
 
-        # Reset button
+        # Workflow shortcut
         st.divider()
+        if st.button("Run Existing Workflow", use_container_width=True, type="secondary"):
+            _sb_workflows = fetch_workflows()
+            st.session_state.workflows = _sb_workflows
+            st.session_state.selected_workflow = None
+            st.session_state.stage = "SELECT_WORKFLOW"
+            st.session_state.messages = []
+            add_message("system", "Select a saved workflow to run.")
+            st.rerun()
+
+        # Reset button
         if st.button("Reset & Upload New File", use_container_width=True):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
@@ -414,21 +458,67 @@ with st.sidebar:
 # MAIN AREA
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# ── Upload State ───────────────────────────────────────────
-if not st.session_state.uploaded:
+# ── Upload State / Home Screen ─────────────────────────────
+if not st.session_state.uploaded and st.session_state.stage not in (
+    "SELECT_WORKFLOW", "WORKFLOW_FILE_SELECT", "WORKFLOW_MAPPING", "WORKFLOW_EXECUTE"
+):
     st.markdown("## Welcome to Auditify")
-    st.markdown("Upload a data file from the sidebar to get started.")
-    st.markdown("""
-    **Supported formats:**
-    - Structured: CSV, Excel (.xlsx, .xls), JSON
-    - Unstructured: PDF
+    st.markdown("Your AI-powered data audit and analysis platform.")
+    st.divider()
 
-    **What happens next:**
-    1. File is analyzed and metadata is extracted
-    2. You can ask natural language queries about your data
-    3. The system generates an execution plan and code
-    4. Results are computed and displayed
-    """)
+    home_col1, home_col2 = st.columns(2, gap="large")
+
+    with home_col1:
+        st.markdown("### Analyze New Data")
+        st.markdown(
+            "Upload one or more data files from the **sidebar**, then ask questions "
+            "in plain English. Auditify will clarify your intent, generate an audit plan, "
+            "write the code, and execute it — all automatically."
+        )
+        st.markdown("""
+**Supported formats:**
+- CSV, Excel (.xlsx / .xls), JSON
+- PDF (text extraction)
+
+**What happens:**
+1. Upload file(s) from the sidebar
+2. Ask a natural language query
+3. Answer a few clarifying questions
+4. Review and confirm the plan
+5. Code is generated and executed
+6. Optionally save as a reusable workflow
+        """)
+        st.info("Upload your file(s) from the left sidebar to get started.")
+
+    with home_col2:
+        st.markdown("### Run an Existing Workflow")
+        st.markdown(
+            "No upload needed. Select a saved workflow, pick the files you want "
+            "to run it on, confirm column mappings, and execute — zero LLM calls "
+            "for planning or code generation."
+        )
+
+        # Load workflows
+        _home_workflows = fetch_workflows()
+
+        if not _home_workflows:
+            st.warning("No saved workflows yet. Complete an analysis first and save it as a workflow.")
+        else:
+            st.success(f"{len(_home_workflows)} saved workflow(s) available.")
+            for _hwf in _home_workflows:
+                _hwf_deps = _hwf.get("file_dependencies", ["default"])
+                with st.container(border=True):
+                    st.markdown(f"**{_hwf.get('description', 'Untitled')}**")
+                    st.caption(f"ID: `{_hwf.get('workflow_id', '')}` · Needs files: {', '.join(f'`{d}`' for d in _hwf_deps)}")
+                    if st.button("Run this Workflow", key=f"home_wf_{_hwf.get('workflow_id')}", type="primary", use_container_width=True):
+                        _full_wf = get_workflow(_hwf.get("workflow_id"))
+                        st.session_state.selected_workflow = _full_wf
+                        st.session_state.workflows = _home_workflows
+                        st.session_state.stage = "WORKFLOW_FILE_SELECT"
+                        st.session_state.messages = []
+                        add_message("system", f"Starting workflow: **{_hwf.get('description', 'Untitled')}**. Please select the files to run it on.")
+                        st.rerun()
+
     st.stop()
 
 
@@ -514,6 +604,7 @@ elif st.session_state.stage == "NEW_QUERY":
             "user_query": query,
             "metadata": st.session_state.metadata,
             "file_path": st.session_state.file_path,
+            "file_registry": st.session_state.get("file_registry", {}),
             "data_summary": st.session_state.get("data_summary", {}),
             "edge_cases": st.session_state.get("edge_cases", {}),
             "conversation_history": [],
@@ -686,6 +777,37 @@ elif st.session_state.stage == "EXECUTING":
 
     code = st.session_state.context.get("code", "")
 
+    # ── Inject file_registry into generated code ──────────────────────
+    import json as _json_exec
+    import re as _re_exec
+    _runtime_registry = dict(st.session_state.get("file_registry", {}))
+    if not _runtime_registry:
+        _fp = st.session_state.get("file_path", "")
+        if _fp:
+            _runtime_registry = {"default": _fp}
+    if _runtime_registry:
+        _reg_lit = _json_exec.dumps(_runtime_registry)
+        if "__FILE_REGISTRY__" in code:
+            code = code.replace("__FILE_REGISTRY__", _reg_lit)
+        elif _re_exec.search(r'^file_registry\s*=', code, flags=_re_exec.MULTILINE):
+            code = _re_exec.sub(
+                r'^file_registry\s*=\s*.*$',
+                lambda _m: f"file_registry = {_reg_lit}",
+                code,
+                flags=_re_exec.MULTILINE,
+            )
+        elif _re_exec.search(r'^file_path\s*=', code, flags=_re_exec.MULTILINE):
+            _primary = _runtime_registry.get("default", list(_runtime_registry.values())[0])
+            code = _re_exec.sub(
+                r'^file_path\s*=\s*.*$',
+                lambda _m: f'file_path = r"{_primary}"',
+                code,
+                flags=_re_exec.MULTILINE,
+            )
+            code = f"file_registry = {_reg_lit}\n" + code
+        else:
+            code = f"file_registry = {_reg_lit}\n" + code
+
     print(f"\n[STAGE] EXECUTING | [EXECUTION] Starting live execution | code_length={len(code)}")
     st.subheader("Live Execution")
 
@@ -806,12 +928,37 @@ elif st.session_state.stage == "EXECUTION_DONE":
                         ctx.get("code", ""),
                         ctx.get("clarifications", {}),
                     )
+
+                    # Build data_signatures: {alias → [col, col, ...]} from current session
+                    # This records which actual columns each file alias used, enabling
+                    # future auto-role-inference when the workflow is replayed.
+                    _current_registry = dict(st.session_state.get("file_registry", {}))
+                    _built_signatures = {}
+                    for _alias, _fpath in _current_registry.items():
+                        if _alias == "default":
+                            continue
+                        try:
+                            _ext = os.path.splitext(_fpath)[1].lower()
+                            if _ext == ".csv":
+                                _sig_df = pd.read_csv(_fpath, nrows=0)
+                            elif _ext in (".xlsx", ".xls"):
+                                _sig_df = pd.read_excel(_fpath, nrows=0)
+                            elif _ext == ".json":
+                                _sig_df = pd.read_json(_fpath, nrows=0)
+                            else:
+                                _sig_df = None
+                            if _sig_df is not None:
+                                _built_signatures[_alias] = _sig_df.columns.tolist()
+                        except Exception:
+                            pass
+
                     wf = save_workflow(
                         code=ctx.get("code", ""),
                         semantic_requirements=semantics.get("semantic_requirements", []),
                         field_mappings=semantics.get("field_mappings", {}),
                         plan=ctx.get("plan", ""),
                         description=wf_desc.strip(),
+                        data_signatures=_built_signatures,
                     )
                 add_message("system", f"Workflow saved! ID: **{wf.get('workflow_id', '')}**")
                 st.session_state.stage = "DONE"
@@ -839,68 +986,394 @@ elif st.session_state.stage == "SELECT_WORKFLOW":
             add_message("system", "What would you like to analyze?")
             st.rerun()
     else:
-        st.subheader("Select a Workflow")
-
-        # ── File selector ──────────────────────────────────
-        st.markdown("**Select the data file to run this workflow on:**")
-        all_reg_files = get_all_files()
-        if all_reg_files:
-            file_options = {
-                f"{e['original_name']} ({e['upload_time'][:10]})": e["local_path"]
-                for e in all_reg_files
-            }
-            # Pre-select the currently active file
-            current_path = st.session_state.file_path
-            default_label = next(
-                (label for label, path in file_options.items() if path == current_path),
-                list(file_options.keys())[0],
-            )
-            chosen_label = st.selectbox(
-                "File for execution",
-                options=list(file_options.keys()),
-                index=list(file_options.keys()).index(default_label),
-                key="wf_file_selector",
-            )
-            selected_file_path = file_options[chosen_label]
-        else:
-            # Fallback: use currently active file
-            selected_file_path = st.session_state.file_path
-            st.info(f"Using current file: `{selected_file_path}`")
-
+        st.subheader("Select a Workflow to Run")
+        st.caption("Pick a workflow below, then select the files you want to run it on.")
         st.divider()
 
         for idx, wf in enumerate(workflows):
             wf_id = wf.get("workflow_id", "")
             desc = wf.get("description", "No description")
             reqs = wf.get("semantic_requirements", [])
+            deps = wf.get("file_dependencies", ["default"])
 
             with st.container(border=True):
-                st.markdown(f"**{desc}**")
-                st.caption(f"ID: {wf_id} | Required fields: {', '.join(reqs) if reqs else 'None'}")
-                if st.button(f"Select", key=f"wf_{idx}", use_container_width=True):
-                    full_wf = get_workflow(wf_id)
-                    st.session_state.selected_workflow = full_wf
-                    # Store the chosen file path for the execution stage
-                    st.session_state.workflow_file_path = selected_file_path
-                    add_message("system", f"Selected workflow: **{desc}** | File: `{os.path.basename(selected_file_path)}`")
+                col_info, col_btn = st.columns([5, 1])
+                with col_info:
+                    st.markdown(f"**{desc}**")
+                    st.caption(f"ID: `{wf_id}`")
+                    st.caption(f"Requires files: **{', '.join(f'`{d}`' for d in deps)}**")
+                    if reqs:
+                        st.caption(f"Required fields: {', '.join(reqs)}")
+                with col_btn:
+                    if st.button("Run Workflow", key=f"wf_run_{idx}", type="primary", use_container_width=True):
+                        full_wf = get_workflow(wf_id)
+                        st.session_state.selected_workflow = full_wf
+                        st.session_state.stage = "WORKFLOW_FILE_SELECT"
+                        add_message("system", f"Selected workflow: **{desc}**. Now select the files to run it on.")
+                        st.rerun()
 
-                    # Try auto-mapping using metadata of selected file
-                    column_names = [c.get("name", "") for c in st.session_state.metadata]
-                    mapping_result = map_fields(full_wf.get("semantic_requirements", []), column_names)
-                    ambiguous = mapping_result.get("ambiguous_fields", [])
-                    missing = mapping_result.get("missing_fields", [])
 
-                    if ambiguous or missing:
-                        st.session_state.workflow_mappings = mapping_result.get("mappings", {})
-                        st.session_state.context["_ambiguous"] = ambiguous
-                        st.session_state.context["_missing"] = missing
-                        st.session_state.context["_mapping_result"] = mapping_result
-                        st.session_state.stage = "WORKFLOW_MAPPING"
-                    else:
-                        st.session_state.workflow_mappings = mapping_result.get("mappings", {})
-                        st.session_state.stage = "WORKFLOW_EXECUTE"
+# ── Stage: Workflow File Selection ────────────────────────
+elif st.session_state.stage == "WORKFLOW_FILE_SELECT":
+    render_messages()
 
-                    st.rerun()
+    import re as _re_wffs
+
+    wf = st.session_state.selected_workflow
+    desc = wf.get("description", "Workflow")
+    data_signatures: dict = wf.get("data_signatures", {})  # {alias: [col, col, ...]}
+
+    # Re-extract aliases actually used in the workflow code (handles variable-indirection
+    # patterns like: customer_alias = "customers"; file_registry[customer_alias]).
+    # This corrects stale/wrong file_dependencies saved in older workflows.
+    _wf_code = wf.get("code_template") or wf.get("code", "")
+    _extracted_aliases: set = set()
+    _extracted_aliases.update(_re_wffs.findall(r'file_registry\["([^"]+)"\]', _wf_code))
+    _extracted_aliases.update(_re_wffs.findall(r"file_registry\['([^']+)'\]", _wf_code))
+    _wf_var_map = {v: val for v, val in _re_wffs.findall(r'(\w+)\s*=\s*["\']([^"\']+)["\']', _wf_code)}
+    for _wf_var in _re_wffs.findall(r'file_registry\[(\w+)\]', _wf_code):
+        if _wf_var in _wf_var_map:
+            _extracted_aliases.add(_wf_var_map[_wf_var])
+    _extracted_aliases.discard("default")
+
+    # Use extracted aliases if found; fall back to saved file_dependencies
+    _saved_deps = wf.get("file_dependencies") or ["default"]
+    deps = sorted(_extracted_aliases) if _extracted_aliases else _saved_deps
+
+    st.subheader(f"Run Workflow — {desc}")
+    st.divider()
+
+    # ── Shared helpers ──────────────────────────────────────
+    def _read_columns(fpath: str) -> list:
+        try:
+            ext = os.path.splitext(fpath)[1].lower()
+            if ext == ".csv":
+                return pd.read_csv(fpath, nrows=0).columns.tolist()
+            elif ext in (".xlsx", ".xls"):
+                return pd.read_excel(fpath, nrows=0).columns.tolist()
+            elif ext == ".json":
+                return pd.read_json(fpath, nrows=0).columns.tolist()
+        except Exception:
+            pass
+        return []
+
+    def _read_columns_combined(dep_selections: dict) -> list:
+        """Read and deduplicate columns from all selected files."""
+        combined = []
+        seen: set = set()
+        for fpath in dep_selections.values():
+            for col in _read_columns(fpath):
+                if col not in seen:
+                    combined.append(col)
+                    seen.add(col)
+        return combined
+
+    def _proceed_with_registry(dep_selections: dict):
+        """Common logic once file→alias mapping is finalised."""
+        st.session_state.workflow_file_registry = dep_selections
+        st.session_state.workflow_file_path = dep_selections.get(deps[0], "")
+
+        dep_summary = ", ".join(f"`{a}` → {os.path.basename(p)}" for a, p in dep_selections.items())
+        add_message("system", f"Files mapped: {dep_summary}")
+
+        unique_columns = _read_columns_combined(dep_selections)
+        st.session_state["_wf_combined_columns"] = unique_columns
+
+        with st.spinner("Auto-mapping columns..."):
+            mapping_result = map_fields(
+                wf.get("semantic_requirements", []),
+                unique_columns or [c.get("name", "") for c in st.session_state.metadata],
+            )
+
+        ambiguous = mapping_result.get("ambiguous_fields", [])
+        missing_fields = mapping_result.get("missing_fields", [])
+
+        if ambiguous or missing_fields:
+            st.session_state.workflow_mappings = mapping_result.get("mappings", {})
+            st.session_state.context["_ambiguous"] = ambiguous
+            st.session_state.context["_missing"] = missing_fields
+            st.session_state.context["_mapping_result"] = mapping_result
+            st.session_state.stage = "WORKFLOW_MAPPING"
+        else:
+            st.session_state.workflow_mappings = mapping_result.get("mappings", {})
+            st.session_state.stage = "WORKFLOW_EXECUTE"
+        st.rerun()
+
+    # ── Section 1: Upload new files ────────────────────────
+    with st.expander("Upload new file(s) for this workflow", expanded=False):
+        new_uploads = st.file_uploader(
+            "Upload files",
+            accept_multiple_files=True,
+            type=["csv", "xlsx", "xls", "json", "pdf"],
+            key="wf_file_uploader",
+        )
+        if new_uploads:
+            if st.button("Process uploaded files", type="secondary"):
+                with st.spinner("Saving uploaded files..."):
+                    for uf in new_uploads:
+                        ext = os.path.splitext(uf.name)[1].lower()
+                        fid = str(uuid.uuid4())
+                        dest = os.path.join(_UPLOAD_DIR, f"{fid}{ext}")
+                        with open(dest, "wb") as fh:
+                            fh.write(uf.getbuffer())
+                        register_file(fid, uf.name, dest, source="upload")
+                st.success(f"Saved {len(new_uploads)} file(s). They now appear in the list below.")
+                st.rerun()
+
+    # ── Section 2: Auto-inference ───────────────────────────
+    all_reg_files = get_all_files()
+    file_options: dict = {}   # label → path
+    for e in all_reg_files:
+        label = f"{e['original_name']}  ({e['upload_time'][:10]})"
+        file_options[label] = e["local_path"]
+    options_list = list(file_options.keys())
+
+    if not options_list:
+        st.warning(
+            f"No files available. This workflow needs **{len(deps)}** file(s): "
+            + ", ".join(f"`{d}`" for d in deps)
+            + ". Upload them using the expander above."
+        )
+        if st.button("Back", use_container_width=True):
+            st.session_state.stage = "SELECT_WORKFLOW"
+            st.rerun()
+        st.stop()
+
+    # Build files_metadata for inference engine
+    _files_meta = []
+    for e in all_reg_files:
+        fpath = e["local_path"]
+        cols = _read_columns(fpath)
+        _files_meta.append({
+            "path": fpath,
+            "columns": cols,
+            "sample_values": {},
+            "inferred_types": {},
+        })
+
+    # Run auto-inference (deterministic + optional LLM refinement)
+    with st.spinner("Analysing files to auto-assign roles..."):
+        inference_result = infer_file_roles(
+            files_metadata=_files_meta,
+            required_roles=deps,
+            data_signatures=data_signatures,
+        )
+
+    role_assignments = inference_result.get("role_assignments", {})
+    ambiguous_roles  = inference_result.get("ambiguous_roles", [])
+    missing_roles    = inference_result.get("missing_roles", [])
+    overall_conf     = inference_result.get("overall_confidence", 0.0)
+    needs_ui         = inference_result.get("needs_ui", True)
+
+    # ── Auto-accept path: all roles mapped with high confidence ──────────────
+    if not needs_ui and not missing_roles:
+        st.success(
+            f"All {len(deps)} file role(s) mapped automatically "
+            f"(confidence: {overall_conf:.0%}). Proceeding..."
+        )
+        for role, assignment in role_assignments.items():
+            conf = assignment["confidence"]
+            fname = os.path.basename(assignment["file_path"])
+            st.markdown(f"- **`{role}`** → `{fname}` _(confidence: {conf:.0%})_")
+            print(f"[AI INFERENCE] Role mapping: {role} → {fname} (confidence={conf:.3f})")
+
+        if st.button("Confirm & Run →", type="primary", use_container_width=True):
+            dep_selections = {role: a["file_path"] for role, a in role_assignments.items()}
+            _proceed_with_registry(dep_selections)
+
+        if st.button("Override (choose files manually)", use_container_width=True):
+            # Force the manual UI by setting a flag and rerunning into the manual section
+            st.session_state["_wf_force_manual"] = True
+            st.rerun()
+
+        if st.button("Back", use_container_width=True):
+            st.session_state.stage = "SELECT_WORKFLOW"
+            st.rerun()
+        st.stop()
+
+    # ── Manual / confirmation UI (fallback) ──────────────────────────────────
+    st.session_state.pop("_wf_force_manual", None)  # clear override flag
+
+    if ambiguous_roles or missing_roles:
+        st.warning(
+            "The system could not fully auto-assign all file roles. "
+            "Please review and confirm the assignments below."
+        )
+    else:
+        st.info("Auto-inference made some low-confidence assignments. Please confirm them.")
+
+    # ── All uploaded files overview ───────────────────────────────────────────
+    with st.expander(f"View all uploaded files ({len(all_reg_files)} files)", expanded=True):
+        st.caption("Use this panel to see what columns each file contains before making assignments below.")
+        for e in all_reg_files:
+            fpath = e["local_path"]
+            fname = e["original_name"]
+            fdate = e["upload_time"][:10]
+            fcols = _read_columns(fpath)
+            st.markdown(f"**`{fname}`** _(uploaded {fdate})_ — {len(fcols)} columns")
+            if fcols:
+                st.code(", ".join(fcols), language=None)
+            else:
+                st.caption("Could not read columns.")
+
+    st.divider()
+
+    # Helper: columns relevant to an alias from data_signatures + code scan
+    wf_field_mappings: dict = wf.get("field_mappings", {})
+    wf_code_template: str = wf.get("code_template", "")
+
+    def _expected_cols_for_alias(alias: str) -> list:
+        # Prefer data_signatures (explicit per-alias columns from save time)
+        if alias in data_signatures and data_signatures[alias]:
+            return data_signatures[alias]
+        # Fallback: scan code template ±30 lines around alias references
+        lines = wf_code_template.splitlines()
+        alias_line_idxs = {i for i, ln in enumerate(lines) if f'"{alias}"' in ln or f"'{alias}'" in ln}
+        if not alias_line_idxs:
+            return list(wf_field_mappings.values())
+        relevant = []
+        for sem, actual_col in wf_field_mappings.items():
+            for ali in alias_line_idxs:
+                nearby = lines[max(0, ali - 30): ali + 30]
+                if any(actual_col in ln for ln in nearby):
+                    if actual_col not in relevant:
+                        relevant.append(actual_col)
+                    break
+        return relevant or list(wf_field_mappings.values())
+
+    # Build reverse map: local_path → original_name (for display)
+    _path_to_name: dict = {e["local_path"]: e["original_name"] for e in all_reg_files}
+
+    def _merge_files_for_alias(selected_labels: list) -> str:
+        """Concatenate multiple files into a single temp CSV and return its path."""
+        dfs = []
+        for lbl in selected_labels:
+            fpath = file_options[lbl]
+            try:
+                ext = os.path.splitext(fpath)[1].lower()
+                if ext == ".csv":
+                    dfs.append(pd.read_csv(fpath))
+                elif ext in (".xlsx", ".xls"):
+                    dfs.append(pd.read_excel(fpath))
+            except Exception:
+                pass
+        if not dfs:
+            return file_options[selected_labels[0]]
+        merged = pd.concat(dfs, ignore_index=True)
+        merged_id = str(uuid.uuid4())
+        merged_path = os.path.join(_UPLOAD_DIR, f"{merged_id}_merged.csv")
+        merged.to_csv(merged_path, index=False)
+        return merged_path
+
+    dep_selections: dict = {}
+    # Store display info for Screen 2: alias → list of original filenames selected
+    dep_display_names: dict = {}
+
+    for dep_alias in deps:
+        inferred = role_assignments.get(dep_alias, {})
+        inferred_path = inferred.get("file_path", "")
+        inferred_conf = inferred.get("confidence", 0.0)
+        inferred_reasoning = inferred.get("reasoning", "")
+        expected_cols = _expected_cols_for_alias(dep_alias)
+
+        with st.container(border=True):
+            st.markdown(f"**Alias: `{dep_alias}`**")
+
+            # Show inference result as context
+            if inferred_path:
+                if inferred_conf >= 0.80:
+                    st.success(
+                        f"Auto-assigned: **{_path_to_name.get(inferred_path, os.path.basename(inferred_path))}** "
+                        f"_(confidence: {inferred_conf:.0%})_"
+                    )
+                elif inferred_conf >= 0.50:
+                    st.warning(
+                        f"Low-confidence assignment: **{_path_to_name.get(inferred_path, os.path.basename(inferred_path))}** "
+                        f"_(confidence: {inferred_conf:.0%})_ — please confirm or change."
+                    )
+                if inferred_reasoning:
+                    st.caption(f"Reasoning: {inferred_reasoning}")
+            else:
+                st.error(f"Could not auto-assign a file for `{dep_alias}`. Please select one.")
+
+            # Show historical columns as info
+            if expected_cols:
+                st.info(
+                    "**Original columns used by this alias:**  \n"
+                    + "  \n".join(f"• `{c}`" for c in expected_cols)
+                )
+
+            # Pre-select the inferred file label
+            inferred_label = next(
+                (lbl for lbl, p in file_options.items() if p == inferred_path), None
+            )
+            default_selection = [inferred_label] if inferred_label else []
+
+            chosen_labels = st.multiselect(
+                f"File(s) for `{dep_alias}` — select one or more to combine:",
+                options=options_list,
+                default=default_selection,
+                key=f"wffs_dep_{dep_alias}",
+            )
+
+            if not chosen_labels:
+                st.caption("Select at least one file above.")
+                dep_selections[dep_alias] = ""
+                dep_display_names[dep_alias] = []
+            else:
+                dep_display_names[dep_alias] = [
+                    _path_to_name.get(file_options[lbl], lbl) for lbl in chosen_labels
+                ]
+                # Live column preview across all chosen files
+                all_chosen_cols: list = []
+                seen_cols: set = set()
+                for lbl in chosen_labels:
+                    for c in _read_columns(file_options[lbl]):
+                        if c not in seen_cols:
+                            all_chosen_cols.append(c)
+                            seen_cols.add(c)
+
+                matching  = [c for c in expected_cols if c in seen_cols]
+                missing_c = [c for c in expected_cols if c not in seen_cols]
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.caption(f"Combined columns across selected file(s) ({len(all_chosen_cols)} total):")
+                    st.code(", ".join(all_chosen_cols), language=None)
+                with col_b:
+                    if matching:
+                        st.success(
+                            f"Found {len(matching)}/{len(expected_cols)} expected columns: "
+                            + ", ".join(f"`{c}`" for c in matching)
+                        )
+                    if missing_c:
+                        st.warning(
+                            "Missing: " + ", ".join(f"`{c}`" for c in missing_c)
+                            + "  \nYou can still proceed — the mapping step will resolve this."
+                        )
+
+                # Resolve to a single path (merge if multiple)
+                if len(chosen_labels) == 1:
+                    dep_selections[dep_alias] = file_options[chosen_labels[0]]
+                else:
+                    dep_selections[dep_alias] = _merge_files_for_alias(chosen_labels)
+
+    # Store display names for Screen 2
+    st.session_state["_wf_dep_display_names"] = dep_display_names
+
+    st.divider()
+    col_back, col_proceed = st.columns([1, 2])
+    with col_back:
+        if st.button("Back", use_container_width=True):
+            st.session_state.stage = "SELECT_WORKFLOW"
+            st.rerun()
+    with col_proceed:
+        if st.button("Proceed →", type="primary", use_container_width=True):
+            bad = [d for d, p in dep_selections.items() if not p or not os.path.exists(p)]
+            if bad:
+                st.error(f"Please select at least one file for: {bad}")
+                st.stop()
+            _proceed_with_registry(dep_selections)
 
 
 # ── Stage: Workflow Mapping ───────────────────────────────
@@ -908,31 +1381,105 @@ elif st.session_state.stage == "WORKFLOW_MAPPING":
     render_messages()
 
     st.subheader("Field Mapping Required")
-    st.markdown("Some fields could not be automatically mapped. Please resolve them:")
+    st.markdown(
+        "The auto-mapper could not confidently map all fields. "
+        "For each field below, the **original column name** (used when the workflow was saved) "
+        "is shown as a hint — select the closest match in your uploaded files."
+    )
 
     mapping_result = st.session_state.context.get("_mapping_result", {})
     mappings = dict(mapping_result.get("mappings", {}))
     ambiguous = st.session_state.context.get("_ambiguous", [])
     missing = st.session_state.context.get("_missing", [])
-    column_names = [c.get("name", "") for c in st.session_state.metadata]
+
+    # Build per-alias overview from display names saved in Screen 1
+    _wf_registry: dict = st.session_state.get("workflow_file_registry", {})
+    _wf_dep_display: dict = st.session_state.get("_wf_dep_display_names", {})
+
+    # For each alias, show the human-readable file names and their combined columns
+    _wf_alias_info: list = []  # list of (alias, display_label, [cols])
+    for _alias, _fpath in _wf_registry.items():
+        _display_names = _wf_dep_display.get(_alias)
+        if _display_names:
+            _display_label = ", ".join(_display_names)
+        else:
+            _display_label = os.path.basename(_fpath)
+        _cols = []
+        try:
+            _ext = os.path.splitext(_fpath)[1].lower()
+            if _ext == ".csv":
+                _cols = pd.read_csv(_fpath, nrows=0).columns.tolist()
+            elif _ext in (".xlsx", ".xls"):
+                _cols = pd.read_excel(_fpath, nrows=0).columns.tolist()
+        except Exception:
+            pass
+        _wf_alias_info.append((_alias, _display_label, _cols))
+
+    # Flat combined column list (for dropdowns)
+    column_names = (
+        st.session_state.get("_wf_combined_columns")
+        or [c.get("name", "") for c in st.session_state.metadata]
+    )
+
+    # ── Files overview panel ──────────────────────────────────────────────────
+    with st.expander(f"View columns in your selected files ({len(_wf_alias_info)} alias(es))", expanded=True):
+        st.caption("Reference this panel to find the right column name in the right file.")
+        for _alias, _display_label, _cols in _wf_alias_info:
+            st.markdown(f"**Alias `{_alias}`** → **`{_display_label}`** — {len(_cols)} columns")
+            if _cols:
+                st.code(", ".join(_cols), language=None)
+            else:
+                st.caption("Could not read columns.")
+
+    st.divider()
+
+    # Original field mappings saved with the workflow (semantic → original_column)
+    _wf_original_mappings: dict = st.session_state.selected_workflow.get("field_mappings", {}) if st.session_state.selected_workflow else {}
 
     with st.form("mapping_form"):
+        if ambiguous:
+            st.markdown("**Ambiguous fields** — multiple possible matches found:")
         for field in ambiguous:
+            original_col = _wf_original_mappings.get(field, "")
             candidates = mappings.get(field, [])
             if isinstance(candidates, list):
+                help_text = f"Originally mapped to: `{original_col}`" if original_col else None
                 choice = st.selectbox(
-                    f"Map '{field}' to:",
+                    f"Map `{field}` to:",
                     options=candidates,
                     key=f"map_{field}",
+                    help=help_text,
                 )
+                if original_col:
+                    st.caption(f"Originally: `{original_col}` → pick the closest column in your files")
                 mappings[field] = choice
 
+        if missing:
+            st.markdown("**Missing fields** — not found automatically in your selected files:")
         for field in missing:
+            original_col = _wf_original_mappings.get(field, "")
+            # Detect computed/derived columns: if the original column name doesn't exist
+            # in any available file columns, it was likely computed by the workflow code
+            # (e.g. a groupby aggregation result) and doesn't need to be mapped.
+            original_col_lower = original_col.lower()
+            column_names_lower = [c.lower() for c in column_names]
+            is_computed = original_col and original_col_lower not in column_names_lower
+            if is_computed:
+                st.info(
+                    f"`{field}` (originally `{original_col}`) appears to be a **computed column** "
+                    "created by the workflow — not an input column from your files. "
+                    "It will be skipped automatically."
+                )
+                continue  # auto-skip, no dropdown needed
+            help_text = f"Originally mapped to: `{original_col}`" if original_col else None
             choice = st.selectbox(
-                f"Map '{field}' to (missing):",
+                f"Map `{field}` to (not found automatically):",
                 options=["-- skip --"] + column_names,
                 key=f"map_missing_{field}",
+                help=help_text,
             )
+            if original_col:
+                st.caption(f"Originally: `{original_col}` → pick the closest column in your files")
             if choice != "-- skip --":
                 mappings[field] = choice
 
@@ -948,37 +1495,99 @@ elif st.session_state.stage == "WORKFLOW_MAPPING":
 elif st.session_state.stage == "WORKFLOW_EXECUTE":
     render_messages()
 
+    import re as _re
+    import json as _json
+
     wf = st.session_state.selected_workflow
     mappings = st.session_state.workflow_mappings
 
     # ── 1. Use code_template (parameterized) or fall back to raw code ──
     workflow_code = wf.get("code_template") or wf.get("code", "")
 
-    # ── 2. Inject runtime file_path ────────────────────────────────────
-    # Priority: user-selected file from file selector > current session file
-    file_path = st.session_state.get("workflow_file_path") or st.session_state.file_path
-    import re as _re
-    if file_path:
-        if "__DYNAMIC_FILE_PATH__" in workflow_code:
-            # New-style template — clean injection
-            workflow_code = workflow_code.replace("__DYNAMIC_FILE_PATH__", file_path)
-        elif _re.search(r'^file_path\s*=', workflow_code, flags=_re.MULTILINE):
-            # Backward compat: replace any existing file_path assignment
-            _replacement = f'file_path = r"{file_path}"'
-            workflow_code = _re.sub(
-                r'^file_path\s*=\s*.*$',
-                lambda _m: _replacement,
-                workflow_code,
-                flags=_re.MULTILINE,
-            )
-        else:
-            # No file_path in code at all — prepend it
-            workflow_code = f'file_path = r"{file_path}"\n' + workflow_code
+    # ── 2. Build runtime file_registry ────────────────────────────────
+    wf_deps = wf.get("file_dependencies") or ["default"]
+    runtime_registry: dict = dict(st.session_state.get("workflow_file_registry", {}))
+
+    # Re-extract aliases actually used in the code (catches variable-indirection
+    # patterns like: customer_alias = "customers"; file_registry[customer_alias])
+    _code_aliases: set = set()
+    _code_aliases.update(_re.findall(r'file_registry\["([^"]+)"\]', workflow_code))
+    _code_aliases.update(_re.findall(r"file_registry\['([^']+)'\]", workflow_code))
+    _var_assignments = {v: val for v, val in _re.findall(r'(\w+)\s*=\s*["\']([^"\']+)["\']', workflow_code)}
+    for _var in _re.findall(r'file_registry\[(\w+)\]', workflow_code):
+        if _var in _var_assignments:
+            _code_aliases.add(_var_assignments[_var])
+    _code_aliases.discard("default")
+
+    # If the code needs named aliases but the runtime_registry only has 'default',
+    # map all named aliases to the default file (best-effort single-file fallback).
+    if _code_aliases and runtime_registry:
+        _default_path = runtime_registry.get("default", list(runtime_registry.values())[0])
+        for _alias in _code_aliases:
+            if _alias not in runtime_registry:
+                # Try to match by alias name against registered file names
+                _matched = next(
+                    (p for lbl, p in runtime_registry.items() if _alias in lbl or lbl in _alias),
+                    _default_path,
+                )
+                runtime_registry[_alias] = _matched
+
+    # Validate that the registry now covers all required aliases from the code
+    all_required = set(wf_deps) | _code_aliases
+    missing_aliases = [a for a in all_required if a not in runtime_registry and a != "default"]
+    if missing_aliases:
+        st.error(
+            f"Session lost the file assignments for alias(es): **{missing_aliases}**. "
+            "Please go back and re-assign your files."
+        )
+        if st.button("← Go back to file selection"):
+            st.session_state.stage = "WORKFLOW_FILE_SELECT"
+            st.rerun()
+        st.stop()
 
     # ── 3. Remap semantic column names → actual column names ───────────
+    # Do this BEFORE injecting the file registry so that file paths in the
+    # registry JSON are never corrupted by the string replacement.
     for semantic_field, actual_column in mappings.items():
         if isinstance(actual_column, str):
             workflow_code = workflow_code.replace(semantic_field, actual_column)
+
+    # ── 4. Inject file_registry into code ─────────────────────────────
+    if runtime_registry:
+        registry_literal = _json.dumps(runtime_registry)
+        if "__FILE_REGISTRY__" in workflow_code:
+            # New-style: replace sentinel
+            workflow_code = workflow_code.replace("__FILE_REGISTRY__", registry_literal)
+        elif "__DYNAMIC_FILE_PATH__" in workflow_code:
+            # Intermediate style: convert to registry injection
+            workflow_code = workflow_code.replace(
+                "__DYNAMIC_FILE_PATH__",
+                runtime_registry.get("default", list(runtime_registry.values())[0]),
+            )
+        elif _re.search(r'^file_registry\s*=', workflow_code, flags=_re.MULTILINE):
+            # Has a file_registry line but no sentinel — replace the whole assignment
+            _reg_repl = f"file_registry = {registry_literal}"
+            workflow_code = _re.sub(
+                r'^file_registry\s*=\s*.*$',
+                lambda _m: _reg_repl,
+                workflow_code,
+                flags=_re.MULTILINE,
+            )
+        elif _re.search(r'^file_path\s*=', workflow_code, flags=_re.MULTILINE):
+            # Legacy single-file: inject registry + keep file_path alias
+            primary = runtime_registry.get("default", list(runtime_registry.values())[0])
+            _fp_repl = f'file_path = r"{primary}"'
+            workflow_code = _re.sub(
+                r'^file_path\s*=\s*.*$',
+                lambda _m: _fp_repl,
+                workflow_code,
+                flags=_re.MULTILINE,
+            )
+            # Also prepend the full registry for any alias access
+            workflow_code = f"file_registry = {registry_literal}\n" + workflow_code
+        else:
+            # No file assignment at all — prepend registry
+            workflow_code = f"file_registry = {registry_literal}\n" + workflow_code
 
     # Live execution viewer
     st.subheader("Workflow Execution")

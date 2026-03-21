@@ -1,5 +1,7 @@
 import json
 import re
+import os
+from difflib import SequenceMatcher
 from vertex_client import call_llm
 from prompts import (
     CLARIFICATION_PROMPT,
@@ -141,15 +143,17 @@ def detect_invalid_responses(clarification_answers: dict, column_names: list) ->
             reason = f"'{answer}' appears to be a refusal rather than a valid answer."
 
         # Check for repeated/identical answers across all questions
-        elif list(clarification_answers.values()).count(answer.strip()) > 1:
-            all_same = len(set(a.strip() for a in clarification_answers.values())) == 1
-            if all_same and len(clarification_answers) > 1:
-                reason = "Same answer given for all questions — likely not meaningful."
+        # Only flag if ALL answers are identical single-word/short tokens (not descriptive selections)
+        elif len(clarification_answers) > 1:
+            all_same = len(set(a.strip().lower() for a in clarification_answers.values())) == 1
+            if all_same and len(answer_clean) < 20:
+                reason = "Same short answer given for all questions — likely not meaningful."
 
-        # Check if answer is just the question repeated back
-        elif answer_clean in question.lower():
-            if len(answer_clean) > 10:
-                reason = "Answer appears to repeat the question."
+        # Check if answer is just the question repeated back verbatim (exact full match only)
+        # Do NOT flag partial containment — questions embed answer options inside them, so a
+        # valid selection will naturally appear as a substring of the question text.
+        elif answer_clean == question.strip().lower():
+            reason = "Answer appears to be the full question repeated back."
 
         if reason:
             invalid_answers.append({
@@ -296,8 +300,11 @@ def generate_plan(query, metadata, clarifications):
     return result
 
 
-def generate_code_instructions(plan, metadata, clarifications, file_path):
-    """Generate high-level code instructions from the plan."""
+def generate_code_instructions(plan, metadata, clarifications, file_registry: dict):
+    """Generate high-level code instructions from the plan.
+
+    file_registry: {alias -> absolute_path} for every available file.
+    """
     print("[FUNCTION] Entering generate_code_instructions")
     column_names = _extract_column_names(metadata)
     prompt = CODE_INSTRUCTION_PROMPT.format(
@@ -305,7 +312,7 @@ def generate_code_instructions(plan, metadata, clarifications, file_path):
         metadata=metadata,
         column_names=column_names,
         clarifications=clarifications,
-        file_path=file_path
+        file_registry=json.dumps(file_registry, indent=2),
     )
     print("[STAGE] CODEGEN | [LLM CALL] Generating code instructions")
     result = call_llm(prompt, caller="generate_code_instructions")
@@ -314,15 +321,20 @@ def generate_code_instructions(plan, metadata, clarifications, file_path):
     return result
 
 
-def generate_code(instructions, metadata, file_path):
-    """Generate executable Python code."""
+def generate_code(instructions, metadata, file_registry: dict):
+    """Generate executable Python code.
+
+    file_registry: {alias -> absolute_path} for every available file.
+    The LLM is instructed to emit  file_registry = __FILE_REGISTRY__
+    as the first line — injected at execution time.
+    """
     print("[FUNCTION] Entering generate_code")
     column_names = _extract_column_names(metadata)
     prompt = CODE_GENERATION_PROMPT.format(
         instructions=instructions,
         metadata=metadata,
         column_names=column_names,
-        file_path=file_path
+        file_registry=json.dumps(file_registry, indent=2),
     )
     print("[STAGE] CODEGEN | [LLM CALL] Generating executable code")
     result = call_llm(prompt, caller="generate_code")
@@ -460,3 +472,185 @@ def extract_workflow_semantics(plan, code, clarifications):
     print("[STAGE] WORKFLOW | [FUNCTION] Could not parse workflow semantics, using fallback")
     print("[FUNCTION] Exiting extract_workflow_semantics")
     return {"semantic_requirements": [], "field_mappings": {}}
+
+
+# ═══════════════════════════════════════════════════════════
+# DATA INTELLIGENCE LAYER — FILE ROLE INFERENCE
+# ═══════════════════════════════════════════════════════════
+
+# Confidence thresholds
+_CONF_AUTO_ACCEPT = 0.80    # >= this → accept automatically, no UI needed
+_CONF_SHOW_UI    = 0.50    # >= this → show confirmation UI
+                            # < 0.50  → require full manual selection
+
+
+def _name_similarity(a: str, b: str) -> float:
+    """Normalised string similarity between two identifiers (0–1)."""
+    a = a.lower().replace("_", "").replace("-", "").replace(" ", "")
+    b = b.lower().replace("_", "").replace("-", "").replace("-", "")
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _score_file_for_role(file_columns: list, role_alias: str, role_signature: list) -> float:
+    """
+    Compute a deterministic confidence score for (file, role) without an LLM call.
+
+    Score = 0.6 * column_overlap  +  0.4 * alias_name_hint
+    - column_overlap: fraction of role_signature columns found (exact or fuzzy) in file_columns
+    - alias_name_hint: best similarity between role_alias tokens and file column names
+    """
+    if not role_signature and not file_columns:
+        return 0.0
+
+    file_cols_lower = [c.lower() for c in file_columns]
+
+    # ── 1. Column overlap score ────────────────────────────
+    matched = 0
+    for sig_col in role_signature:
+        sig_lower = sig_col.lower()
+        # Exact match
+        if sig_lower in file_cols_lower:
+            matched += 1.0
+            continue
+        # Fuzzy match (threshold 0.75)
+        best = max((_name_similarity(sig_lower, fc) for fc in file_cols_lower), default=0.0)
+        if best >= 0.75:
+            matched += best
+
+    overlap_score = matched / max(len(role_signature), 1)
+
+    # ── 2. Alias name hint score ───────────────────────────
+    # Tokenise the role alias ("sales_transactions" → ["sales", "transactions"])
+    role_tokens = re.split(r'[_\-\s\(\)]+', role_alias.lower())
+    role_tokens = [t for t in role_tokens if len(t) > 2]
+
+    hint_score = 0.0
+    if role_tokens:
+        best_per_token = []
+        for token in role_tokens:
+            best = max((_name_similarity(token, fc) for fc in file_cols_lower), default=0.0)
+            best_per_token.append(best)
+        hint_score = sum(best_per_token) / len(best_per_token)
+
+    return round(0.6 * overlap_score + 0.4 * hint_score, 4)
+
+
+def infer_file_roles(
+    files_metadata: list,
+    required_roles: list,
+    data_signatures: dict,
+) -> dict:
+    """
+    Automatically map uploaded files to the workflow's required alias roles.
+
+    Parameters
+    ----------
+    files_metadata : list of dicts, each with:
+        {
+            "path": str,
+            "columns": list[str],
+            "sample_values": dict,   # optional
+            "inferred_types": dict,  # optional
+        }
+    required_roles : list[str]   — alias names from workflow.file_dependencies
+    data_signatures : dict       — {alias: [col, col, ...]} from workflow.data_signatures
+
+    Returns
+    -------
+    {
+        "role_assignments": {
+            "alias": {
+                "file_path": str,
+                "confidence": float,
+                "reasoning": str,
+                "source": "auto"
+            }
+        },
+        "ambiguous_roles": [str],
+        "missing_roles": [str],
+        "overall_confidence": float,
+        "needs_ui": bool,   # True if any role has confidence < _CONF_AUTO_ACCEPT
+    }
+    """
+    print(f"[FUNCTION] Entering infer_file_roles | roles={required_roles} | files={len(files_metadata)}")
+
+    # ── Phase 1: Deterministic scoring matrix ─────────────
+    # score_matrix[role][file_path] = score
+    score_matrix: dict[str, dict[str, float]] = {}
+    for role in required_roles:
+        sig = data_signatures.get(role, [])
+        score_matrix[role] = {}
+        for fm in files_metadata:
+            fpath = fm.get("path", "")
+            score = _score_file_for_role(fm.get("columns", []), role, sig)
+            score_matrix[role][fpath] = score
+            print(f"[DETERMINISTIC] Score: role='{role}' file='{os.path.basename(fpath)}' score={score:.3f}")
+
+    # ── Phase 2: Greedy assignment (highest score wins, each file used once) ──
+    assigned_files: set[str] = set()
+    role_assignments: dict = {}
+    ambiguous_roles: list = []
+    missing_roles: list = []
+
+    # Sort roles by max available score desc (assign most confident first)
+    def _best_score(role):
+        scores = score_matrix[role]
+        available = {p: s for p, s in scores.items() if p not in assigned_files}
+        return max(available.values(), default=0.0)
+
+    for role in sorted(required_roles, key=_best_score, reverse=True):
+        available = {p: s for p, s in score_matrix[role].items() if p not in assigned_files}
+        if not available:
+            missing_roles.append(role)
+            print(f"[AMBIGUOUS] Role requires user selection: '{role}' → no files available")
+            continue
+
+        best_path = max(available, key=available.get)
+        best_score = available[best_path]
+
+        if best_score < 0.30:
+            missing_roles.append(role)
+            print(f"[AMBIGUOUS] Role requires user selection: '{role}' → score={best_score:.3f} too low, no confident match")
+            continue
+
+        assigned_files.add(best_path)
+        role_assignments[role] = {
+            "file_path": best_path,
+            "confidence": best_score,
+            "reasoning": (
+                f"Deterministic score {best_score:.2f} based on column overlap with "
+                f"signature {data_signatures.get(role, [])} and alias-name similarity."
+            ),
+            "source": "auto",
+        }
+        print(f"[DETERMINISTIC] Role mapping: '{role}' → '{os.path.basename(best_path)}' (score={best_score:.3f})")
+
+    # ── Phase 3: Mark low-confidence assignments as ambiguous (requires user confirmation) ──
+    for role, assignment in role_assignments.items():
+        conf = assignment["confidence"]
+        if _CONF_SHOW_UI <= conf < _CONF_AUTO_ACCEPT:
+            if role not in ambiguous_roles:
+                ambiguous_roles.append(role)
+            candidates = [
+                os.path.basename(p)
+                for p in score_matrix[role]
+                if score_matrix[role][p] >= 0.30
+            ]
+            print(f"[AMBIGUOUS] Role requires user selection: '{role}' → candidates: {candidates}")
+
+    # ── Phase 4: Compute overall confidence and needs_ui flag ─────────────────
+    confs = [v["confidence"] for v in role_assignments.values()]
+    overall = round(sum(confs) / len(confs), 4) if confs else 0.0
+    needs_ui = bool(ambiguous_roles or missing_roles)
+
+    result = {
+        "role_assignments": role_assignments,
+        "ambiguous_roles": ambiguous_roles,
+        "missing_roles": missing_roles,
+        "overall_confidence": overall,
+        "needs_ui": needs_ui,
+    }
+
+    print(f"[DETERMINISTIC] Final: assigned={list(role_assignments.keys())} ambiguous={ambiguous_roles} missing={missing_roles} overall_conf={overall:.3f} needs_ui={needs_ui}")
+    print("[FUNCTION] Exiting infer_file_roles")
+    return result

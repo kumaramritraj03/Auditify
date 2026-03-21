@@ -314,7 +314,12 @@ CLARIFICATION_VALIDATION_PROMPT = """
 You are a Validation Engine for Auditify.
 
 Your job is to validate user-provided clarification answers against the actual metadata.
-You MUST catch invalid column references, nonsensical answers, and mismatches.
+
+IMPORTANT CONTEXT:
+- Clarification questions often embed available options inside the question text itself (e.g. "Available options: ['TransactionID (found near OrderDate...)']").
+- A valid answer is the user SELECTING one of those embedded options — so the answer will naturally appear as a substring of the question. This is CORRECT behaviour, not a problem.
+- Do NOT flag an answer just because it appears inside the question text.
+- Answers may be descriptive selections like "TransactionID (found near OrderDate, ProductCategory)" — these are valid as long as they reference a real column that exists in the dataset.
 
 INPUT:
 User Query: {query}
@@ -329,10 +334,15 @@ Full Metadata:
 {metadata}
 
 TASK:
-For each answer, check:
-1. If the answer references a column name, does that column ACTUALLY exist in the dataset?
-2. Is the answer semantically reasonable for the question asked?
-3. Is the answer nonsensical, random, or clearly wrong?
+For each answer, check ONLY:
+1. Is the answer complete gibberish, a refusal (e.g. "idk", "skip", "n/a"), or completely off-topic for the question?
+2. Does the answer reference a column name that does NOT exist anywhere in the dataset at all?
+   (A descriptive answer like "TransactionID (found near OrderDate)" is valid if "TransactionID" exists.)
+
+DO NOT flag an answer for:
+- Being a substring of the question (that means the user selected an offered option — correct!)
+- Being long or descriptive
+- Repeating column names that appear in the question's "Available options" list
 
 OUTPUT FORMAT (STRICT JSON):
 {{
@@ -437,8 +447,8 @@ Available Column Names:
 Clarifications:
 {clarifications}
 
-Data File Path:
-{file_path}
+Available Files (file_registry):
+{file_registry}
 
 TASK:
 Convert plan into structured instructions. Each instruction must specify:
@@ -473,11 +483,20 @@ CORE PHILOSOPHY:
 - ALWAYS assume data can be arbitrarily large
 
 ===========================================================
-VALID COLUMNS IN THE DATASET (use ONLY these):
+VALID COLUMNS ACROSS ALL DATASETS (use ONLY these):
 {column_names}
 
-DATA FILE PATH (use this EXACT path, do NOT modify or fabricate paths):
-{file_path}
+AVAILABLE DATA FILES (file_registry dict — use ONLY these aliases, NEVER hardcode paths):
+{file_registry}
+
+Each key is a semantic alias (e.g. "sales", "customers").
+Each value is the actual absolute file path.
+
+STRICT FILE RULES:
+- Access files ONLY via: file_registry["alias"]
+- NEVER hardcode or guess file paths
+- If the query requires multiple datasets → use multiple aliases
+- If an alias is missing → raise ValueError immediately
 ===========================================================
 
 MANDATORY RULES (follow ALL of these):
@@ -567,6 +586,14 @@ CRITICAL DuckDB API RULES (violating these will cause runtime errors):
 - To register a DataFrame: `con.register("name", df)`
 - To read CSV directly: `con.execute("SELECT * FROM read_csv_auto('path')")`
 - For .xlsx/.xls files: load with `pd.read_excel(path)` first, then `con.register("name", df)`
+
+⚠️ MULTI-FILE WORKFLOW RULES (MANDATORY):
+- NEVER assume a single file. ALWAYS use file_registry["alias"] for EVERY data access.
+- The FIRST line MUST be: file_registry = __FILE_REGISTRY__
+- For EACH alias required, validate: if "alias" not in file_registry: raise ValueError(...)
+- After loading each file, log its columns: print(f"[alias] columns: {list(df.columns)}")
+- This ensures workflows remain replayable on any structurally compatible dataset.
+
 🚨 FINAL DETERMINISM GUARANTEE
 
 Before generating code, internally verify:
@@ -582,13 +609,12 @@ IF ANY CHECK FAILS:
 
 REFERENCE TEMPLATE (adapt to the task, do NOT copy blindly):
 ```
-file_path = r"{file_path}"
+file_registry = __FILE_REGISTRY__
 con = duckdb.connect(database=':memory:')
 
-# For Excel files:
-df = pd.read_excel(file_path)
-# For CSV files:
-# df = pd.read_csv(file_path)
+# Load files via registry aliases — NEVER hardcode paths
+sales_path = file_registry["sales"]
+df = pd.read_excel(sales_path)   # or pd.read_csv(sales_path) for CSV
 
 print(f"Loaded {{len(df)}} rows")
 
@@ -619,7 +645,8 @@ Metadata:
 
 TASK:
 Generate production-safe Python code following ALL rules above.
-Load data from the file path. Process with DuckDB. Store output in `result`.
+Start with: file_registry = __FILE_REGISTRY__
+Load files ONLY via file_registry["alias"]. Process with DuckDB. Store output in `result`.
 Use ONLY column names from the VALID COLUMNS list.
 
 OUTPUT:
@@ -780,8 +807,13 @@ Clarifications:
 
 TASK:
 Extract:
-- semantic field requirements (the abstract field names the workflow needs, e.g. "bill_amount", "vendor_name")
-- the field mappings used in this execution (which semantic field mapped to which actual column)
+- semantic field requirements: ONLY the INPUT/SOURCE columns read from files (e.g. columns passed to pd.read_csv, used in df["col"], groupby, merge, filter). Do NOT include computed/derived columns that the code creates as output (e.g. results of groupby aggregations, new columns assigned with df["new_col"] = ..., or output DataFrame column names).
+- the field mappings used in this execution (which semantic field mapped to which actual SOURCE column)
+
+CRITICAL RULES:
+- semantic_requirements must ONLY contain columns that exist in the SOURCE FILES before any computation.
+- NEVER include columns that are created by the code (aggregation results, computed columns, output column names).
+- If a column appears on the LEFT side of an assignment (df["x"] = ...) and was not read from a file, it is computed — exclude it.
 
 OUTPUT FORMAT (STRICT JSON):
 {{
@@ -935,4 +967,37 @@ OUTPUT FORMAT (STRICT JSON):
 If there are NO ambiguities, return "ambiguities": [].
 
 Do not perform calculations or analysis. Only establish structural awareness.
+"""
+
+
+# =========================================================
+# CODE GENERATION PROMPT MULTI-FILE ADDENDUM
+# =========================================================
+
+CODE_GENERATION_MULTIFILE_ADDENDUM = """
+
+⚠️ MULTI-FILE WORKFLOW RULES (MANDATORY — applies to ALL generated code):
+
+RULE A: NEVER assume a single file exists.
+  - ALWAYS use file_registry["alias"] to access ANY data file.
+  - NEVER hardcode paths, NEVER use variables like `file_path = "..."`.
+  - The FIRST line of code MUST be: file_registry = __FILE_REGISTRY__
+
+RULE B: Validate all aliases exist before use.
+  - For EACH alias the code requires:
+    if "alias" not in file_registry:
+        raise ValueError("Required file alias 'alias' not found in file_registry.")
+
+RULE C: Handle each file independently.
+  - Load each file separately via its alias.
+  - Register each in DuckDB with a descriptive name matching the alias.
+
+RULE D: All field references MUST use the semantic alias system.
+  - Access columns using the EXACT names from the VALID COLUMNS list.
+  - If a column name may differ on re-run (workflow replay), use TRY_CAST and handle gracefully.
+
+RULE E: data_signatures for future workflow compatibility.
+  - After loading each file, log which columns are present:
+    print(f"[alias] columns: {{list(df.columns)}}")
+  - This enables future auto-mapping on replay.
 """

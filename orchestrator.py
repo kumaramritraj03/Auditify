@@ -415,6 +415,13 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
     column_names = _extract_column_names(metadata)
     attempt_count = context.get("clarification_attempt_count", 0)
 
+    # ── Build file_registry from context ──────────────────
+    # Prefer explicit registry; fall back to single file_path → "default" alias.
+    file_registry: dict = context.get("file_registry", {})
+    if not file_registry and file_path:
+        # Backward-compat: single file uploaded → wrap in registry
+        file_registry = {"default": file_path}
+
     # ── classify_query ──
     if next_tool == "classify_query":
         print("[EXECUTION] Executing tool: classify_query")
@@ -495,9 +502,9 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
     if next_tool == "generate_code":
         print("[EXECUTION] Executing tool: generate_code")
         instructions = generate_code_instructions(
-            plan, metadata, clarifications, file_path
+            plan, metadata, clarifications, file_registry
         )
-        generated_code = generate_code(instructions, metadata, file_path)
+        generated_code = generate_code(instructions, metadata, file_registry)
         return {
             "stage": "CODE_GENERATED",
             "data": generated_code,
