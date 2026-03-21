@@ -10,7 +10,9 @@ import streamlit as st
 import pandas as pd
 import os
 import uuid
+import requests
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 # ── Import backend modules directly ────────────────────────
 from metadata import extract_structured_metadata, process_pdf_file
@@ -18,6 +20,7 @@ from orchestrator import handle_query_v2
 from workflow import fetch_workflows, get_workflow, save_workflow
 from execution import execute_code, execute_code_repl
 from agents import extract_workflow_semantics, map_fields
+from file_registry import register_file, get_all_files
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _UPLOAD_DIR = os.path.join(_BASE_DIR, "uploads")
@@ -54,6 +57,8 @@ def _init_state():
         "workflows": [],
         "selected_workflow": None,
         "workflow_mappings": {},
+        # Workflow execution — selected file override
+        "workflow_file_path": "",   # file_path chosen for current workflow run
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -117,6 +122,38 @@ def extract_metadata(file_type: str, local_path: str) -> dict:
     return {"columns": [], "data_summary": {}, "edge_cases": {}}
 
 
+def download_external_file(url: str) -> tuple:
+    """Download a public URL or Google Drive share link.
+    Returns (original_name, local_path, file_id) or (None, None, None) on failure."""
+    try:
+        # Convert Google Drive share link → direct download URL
+        if "drive.google.com" in url and "/d/" in url:
+            gd_id = url.split("/d/")[1].split("/")[0]
+            url = f"https://drive.google.com/uc?id={gd_id}&export=download"
+
+        response = requests.get(url, stream=True, timeout=20)
+        response.raise_for_status()
+
+        parsed = urlparse(url)
+        raw_name = os.path.basename(parsed.path) or "downloaded_file"
+        ext = raw_name.rsplit(".", 1)[-1].lower() if "." in raw_name else "csv"
+        if ext not in ("csv", "xlsx", "xls", "json", "pdf"):
+            ext = "csv"
+
+        file_id = str(uuid.uuid4())
+        local_path = os.path.join(_UPLOAD_DIR, f"{file_id}.{ext}")
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        original_name = raw_name if "." in raw_name else f"{raw_name}.{ext}"
+        return original_name, local_path, file_id
+
+    except Exception as e:
+        print(f"[FUNCTION] download_external_file failed: {e}")
+        return None, None, None
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SIDEBAR
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -135,6 +172,45 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
+    # ── External File (URL / Google Drive) ────────────────
+    with st.expander("Load from URL / Google Drive", expanded=False):
+        ext_url = st.text_input(
+            "Paste a public URL or Google Drive share link",
+            placeholder="https://drive.google.com/file/d/.../view  or  https://example.com/data.csv",
+            key="ext_url_input",
+        )
+        if st.button("Download & Load", key="ext_url_btn", use_container_width=True):
+            if ext_url.strip():
+                with st.spinner("Downloading file..."):
+                    orig_name, local_path, file_id = download_external_file(ext_url.strip())
+                if local_path:
+                    ext = local_path.rsplit(".", 1)[-1].lower()
+                    ftype = "excel" if ext in ("xlsx", "xls") else ext
+                    register_file(file_id, orig_name, local_path, source="url")
+                    result = extract_metadata(ftype, local_path)
+                    cols = result.get("columns", [])
+                    st.session_state.metadata = cols
+                    st.session_state.data_summary = result.get("data_summary", {})
+                    st.session_state.edge_cases = result.get("edge_cases", {})
+                    st.session_state.file_path = local_path
+                    st.session_state.file_type = ftype
+                    st.session_state.source_id = file_id
+                    st.session_state.sources = [{
+                        "source_id": file_id, "name": orig_name,
+                        "type": ftype, "path": local_path,
+                        "column_count": len(cols),
+                        "edge_cases": result.get("edge_cases", {}),
+                    }]
+                    st.session_state.uploaded = True
+                    st.session_state.stage = "QUERY"
+                    st.session_state.messages = []
+                    add_message("system", f"Loaded external file: **{orig_name}**. Metadata extracted.")
+                    st.rerun()
+                else:
+                    st.error("Failed to download file. Check the URL and try again.")
+            else:
+                st.warning("Please enter a URL.")
+
     if uploaded_files and not st.session_state.uploaded:
         print(f"\n[STAGE] UPLOAD | [FUNCTION] Processing {len(uploaded_files)} file(s)")
         with st.spinner(f"Processing {len(uploaded_files)} file(s) & extracting metadata..."):
@@ -148,6 +224,10 @@ with st.sidebar:
             if not saved:
                 st.error("No supported files found.")
             else:
+                # Step 1b: Register all saved files in the file registry
+                for s in saved:
+                    register_file(s["id"], s["name"], s["path"], source="upload")
+
                 # Step 2: Extract metadata in parallel
                 def _extract_one(item):
                     return {**item, "result": extract_metadata(item["type"], item["path"])}
@@ -212,6 +292,25 @@ with st.sidebar:
     # ── Data Summary (after upload) ────────────────────────
     if st.session_state.uploaded:
         st.divider()
+
+        # ── File Registry Panel ─────────────────────────────
+        all_files = get_all_files()
+        if all_files:
+            with st.expander("File Registry", expanded=False):
+                for entry in all_files:
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        st.caption(f"**{entry['original_name']}**")
+                        st.code(entry["local_path"], language=None)
+                    with col_b:
+                        # Streamlit doesn't have a native copy-to-clipboard button;
+                        # show the path in a text_input so user can select-all & copy.
+                        st.text_input(
+                            "Copy path",
+                            value=entry["local_path"],
+                            key=f"copy_{entry['file_id']}",
+                            label_visibility="collapsed",
+                        )
 
         # Show multi-source summary if multiple files uploaded
         sources = st.session_state.sources
@@ -741,6 +840,35 @@ elif st.session_state.stage == "SELECT_WORKFLOW":
             st.rerun()
     else:
         st.subheader("Select a Workflow")
+
+        # ── File selector ──────────────────────────────────
+        st.markdown("**Select the data file to run this workflow on:**")
+        all_reg_files = get_all_files()
+        if all_reg_files:
+            file_options = {
+                f"{e['original_name']} ({e['upload_time'][:10]})": e["local_path"]
+                for e in all_reg_files
+            }
+            # Pre-select the currently active file
+            current_path = st.session_state.file_path
+            default_label = next(
+                (label for label, path in file_options.items() if path == current_path),
+                list(file_options.keys())[0],
+            )
+            chosen_label = st.selectbox(
+                "File for execution",
+                options=list(file_options.keys()),
+                index=list(file_options.keys()).index(default_label),
+                key="wf_file_selector",
+            )
+            selected_file_path = file_options[chosen_label]
+        else:
+            # Fallback: use currently active file
+            selected_file_path = st.session_state.file_path
+            st.info(f"Using current file: `{selected_file_path}`")
+
+        st.divider()
+
         for idx, wf in enumerate(workflows):
             wf_id = wf.get("workflow_id", "")
             desc = wf.get("description", "No description")
@@ -752,9 +880,11 @@ elif st.session_state.stage == "SELECT_WORKFLOW":
                 if st.button(f"Select", key=f"wf_{idx}", use_container_width=True):
                     full_wf = get_workflow(wf_id)
                     st.session_state.selected_workflow = full_wf
-                    add_message("system", f"Selected workflow: **{desc}**")
+                    # Store the chosen file path for the execution stage
+                    st.session_state.workflow_file_path = selected_file_path
+                    add_message("system", f"Selected workflow: **{desc}** | File: `{os.path.basename(selected_file_path)}`")
 
-                    # Try auto-mapping
+                    # Try auto-mapping using metadata of selected file
                     column_names = [c.get("name", "") for c in st.session_state.metadata]
                     mapping_result = map_fields(full_wf.get("semantic_requirements", []), column_names)
                     ambiguous = mapping_result.get("ambiguous_fields", [])
@@ -821,17 +951,34 @@ elif st.session_state.stage == "WORKFLOW_EXECUTE":
     wf = st.session_state.selected_workflow
     mappings = st.session_state.workflow_mappings
 
-    workflow_code = wf.get("code", "")
+    # ── 1. Use code_template (parameterized) or fall back to raw code ──
+    workflow_code = wf.get("code_template") or wf.get("code", "")
 
-    # Remap columns
+    # ── 2. Inject runtime file_path ────────────────────────────────────
+    # Priority: user-selected file from file selector > current session file
+    file_path = st.session_state.get("workflow_file_path") or st.session_state.file_path
+    import re as _re
+    if file_path:
+        if "__DYNAMIC_FILE_PATH__" in workflow_code:
+            # New-style template — clean injection
+            workflow_code = workflow_code.replace("__DYNAMIC_FILE_PATH__", file_path)
+        elif _re.search(r'^file_path\s*=', workflow_code, flags=_re.MULTILINE):
+            # Backward compat: replace any existing file_path assignment
+            _replacement = f'file_path = r"{file_path}"'
+            workflow_code = _re.sub(
+                r'^file_path\s*=\s*.*$',
+                lambda _m: _replacement,
+                workflow_code,
+                flags=_re.MULTILINE,
+            )
+        else:
+            # No file_path in code at all — prepend it
+            workflow_code = f'file_path = r"{file_path}"\n' + workflow_code
+
+    # ── 3. Remap semantic column names → actual column names ───────────
     for semantic_field, actual_column in mappings.items():
         if isinstance(actual_column, str):
             workflow_code = workflow_code.replace(semantic_field, actual_column)
-
-    # Inject file path
-    file_path = st.session_state.file_path
-    if file_path:
-        workflow_code = f'file_path = r"{file_path}"\n' + workflow_code
 
     # Live execution viewer
     st.subheader("Workflow Execution")

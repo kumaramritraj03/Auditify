@@ -82,7 +82,8 @@ class WorkflowSaveRequest(BaseModel):
     semantic_requirements: List[str] = []
     field_mappings: Dict[str, str] = {}
     clarifications: Dict[str, str] = {}
-
+    code_template: Optional[str] = None
+    parameters: List[str] = []
 
 class WorkflowRunRequest(BaseModel):
     workflow_id: str

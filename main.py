@@ -10,9 +10,12 @@ from metadata import (
     extract_structured_metadata,
     process_pdf_file, process_sql_source
 )
+from file_registry import register_file, get_all_files
 import uuid
 import os
 import shutil
+from urllib.parse import urlparse
+import requests
 
 app = FastAPI(title="Auditify", version="2.0")
 
@@ -42,6 +45,7 @@ async def upload_file(file: UploadFile):
         shutil.copyfileobj(file.file, buffer)
 
     extracted = _extract_metadata(ext, local_path)
+    register_file(file_id, file.filename, local_path, source="upload")
 
     return {
         "source_id": file_id,
@@ -71,7 +75,8 @@ async def upload_batch(files: List[UploadFile] = File(...)):
         ext, local_path = _resolve_file_type(filename, file_id)
         with open(local_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        saved_files.append({"file_id": file_id, "ext": ext, "local_path": local_path})
+        register_file(file_id, file.filename, local_path, source="upload")
+        saved_files.append({"file_id": file_id, "ext": ext, "local_path": local_path, "name": file.filename})
 
     # Step 2: Extract metadata in parallel — each file is independent
     def _process_one(item):
@@ -108,6 +113,48 @@ def get_upload_status(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
+
+
+@app.post("/upload/external")
+def upload_external_file(body: dict):
+    """Download a file from a public URL or Google Drive share link and register it.
+
+    Input: {"url": "https://..."}
+    Output: same shape as /upload
+    """
+    url = body.get("url", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    upload_dir = os.path.join(_BASE_DIR, "uploads")
+    orig_name, local_path, file_id = download_external_file(url, upload_dir)
+    if not local_path:
+        raise HTTPException(status_code=400, detail="Failed to download file from the provided URL.")
+
+    ext = local_path.rsplit(".", 1)[-1].lower()
+    file_type = "excel" if ext in ("xlsx", "xls") else ext
+
+    source = "gdrive" if "drive.google.com" in url else "url"
+    register_file(file_id, orig_name, local_path, source=source)
+
+    extracted = _extract_metadata(file_type, local_path)
+
+    return {
+        "source_id": file_id,
+        "local_path": local_path,
+        "original_name": orig_name,
+        "metadata": extracted.get("columns", []),
+        "data_summary": extracted.get("data_summary", {}),
+        "edge_cases": extracted.get("edge_cases", {}),
+        "type": file_type,
+        "status": "COMPLETED",
+    }
+
+
+@app.get("/files")
+def list_files():
+    """Return all registered files (uploaded or external)."""
+    return {"files": get_all_files()}
 
 
 @app.post("/connect/sql")
@@ -203,15 +250,26 @@ def run_workflow_endpoint(req: WorkflowRunRequest):
                 "message": "Some fields could not be automatically mapped. Please provide mappings."
             }
 
-    # Remap code with new column names
-    workflow_code = wf.get("code", "")
+    # 1. Load template (fallback to raw code for older workflows)
+    workflow_code = wf.get("code_template", wf.get("code", ""))
+
+    # 2. Remap semantic columns
     for semantic_field, actual_column in field_mappings.items():
         if isinstance(actual_column, str):
             workflow_code = workflow_code.replace(semantic_field, actual_column)
 
-    # Inject new file path
+    # 3. Inject Dynamic File Path Safely
     if req.file_path:
-        workflow_code = f'file_path = r"{req.file_path}"\n' + workflow_code
+        if "__DYNAMIC_FILE_PATH__" in workflow_code:
+            workflow_code = workflow_code.replace("__DYNAMIC_FILE_PATH__", req.file_path)
+        else:
+            # Backward compatibility for workflows saved before this update
+            import re
+            new_path_line = f'file_path = r"{req.file_path}"'
+            if re.search(r'^file_path\s*=', workflow_code, flags=re.MULTILINE):
+                workflow_code = re.sub(r'^file_path\s*=\s*.*$', new_path_line, workflow_code, flags=re.MULTILINE)
+            else:
+                workflow_code = new_path_line + "\n" + workflow_code
 
     result = execute_code(workflow_code)
     return {
@@ -219,8 +277,6 @@ def run_workflow_endpoint(req: WorkflowRunRequest):
         "data": result,
         "message": "Workflow execution complete."
     }
-
-
 # ── Internal Helpers ─────────────────────────────────────
 
 def _resolve_file_type(filename: str, file_id: str) -> tuple:
@@ -245,6 +301,35 @@ def _resolve_file_type(filename: str, file_id: str) -> tuple:
             detail="Unsupported format. Supported: csv, xlsx, xls, json, pdf, png, jpg"
         )
 
+
+from urllib.parse import urlparse
+
+def download_external_file(url: str, upload_dir: str):
+    """Downloads a public URL or Google Drive link."""
+    try:
+        # Google Drive direct-download conversion
+        if "drive.google.com" in url and "/d/" in url:
+            file_id = url.split("/d/")[1].split("/")[0]
+            url = f"https://drive.google.com/uc?id={file_id}&export=download"
+
+        response = requests.get(url, stream=True, timeout=15)
+        response.raise_for_status()
+
+        parsed_url = urlparse(url)
+        filename = os.path.basename(parsed_url.path) or "downloaded_file.csv"
+        
+        file_id = str(uuid.uuid4())
+        ext = filename.split(".")[-1] if "." in filename else "csv"
+        local_path = os.path.join(upload_dir, f"{file_id}.{ext}")
+
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return filename, local_path, file_id
+    except Exception as e:
+        print(f"Failed to download URL: {e}")
+        return None, None, None
 
 def _extract_metadata(ext: str, local_path: str):
     """Extract metadata based on file type. Returns standardized format for ALL types.
