@@ -1,18 +1,17 @@
 """
-Auditify — Hybrid Orchestrator
+Auditify — LLM-Driven Deterministic Orchestrator
 
 Architecture:
-  Python FSM = Authority (always has final say)
-  LLM Advisor = Intelligence layer (suggests next action via ORCHESTRATOR_PROMPT)
+  LLM (decision) → Python (validation) → Execution
 
 Flow:
-  1. LLM advisor analyzes full context and suggests next_tool
-  2. Python validator checks if suggestion is legal
-  3. If valid and matches FSM → execute with LLM reasoning logged
-  4. If invalid or LLM fails → fallback to pure FSM (no degradation)
+  1. LLM orchestrator analyzes full context and decides next_tool
+  2. Python validation layer checks if decision is legal (allowed transitions + preconditions)
+  3. If valid → execute the decided tool
+  4. If invalid → raise error (no silent fallback, no hidden FSM)
 
-The LLM layer is ADDITIVE. Removing it produces identical behavior to the
-original deterministic orchestrator.
+The LLM is the SINGLE source of truth for orchestration decisions.
+Python enforces guardrails but does NOT make decisions.
 """
 
 import json
@@ -70,68 +69,114 @@ _ALLOWED_TRANSITIONS = {
 
 
 def handle_query_v2(context: dict):
-    """Hybrid orchestrator: LLM advises, Python decides.
+    """LLM-driven orchestrator: LLM decides, Python validates, then executes.
 
-    1. Consult LLM advisor for next_tool suggestion + reasoning
-    2. Validate suggestion against allowed transitions and state
-    3. Execute via FSM (authority) — LLM reasoning is logged, not trusted blindly
-    4. On any LLM failure → seamless fallback to pure FSM
+    1. Query LLM for next_tool decision + reasoning
+    2. Validate decision against allowed transitions and preconditions
+    3. If valid → execute the tool
+    4. If LLM fails or returns invalid → deterministic fallback based on stage
     """
     stage = context.get("current_stage", "START")
+    print(f"\n{'='*60}")
+    print(f"[ORCHESTRATION] ========== handle_query_v2 ==========")
+    print(f"[ORCHESTRATION] Current Stage: {stage}")
+    print(f"[ORCHESTRATION] User Query: {str(context.get('user_query', ''))[:100]}")
 
-    # ── Step 1: Get LLM advice (non-blocking — failures are safe) ──
-    llm_decision = _llm_advise(context)
+    # ── Step 1: Get LLM decision ──
+    print(f"[ORCHESTRATION] Step 1: Getting LLM decision...")
+    llm_decision = _get_llm_decision(context)
 
-    # ── Step 2: Validate LLM suggestion ──
-    validation = _validate_llm_decision(llm_decision, context)
-
-    # ── Step 3: Log decision pipeline ──
+    # ── Step 2: Validate LLM decision ──
     if llm_decision:
-        logger.info(
-            "LLM advised: next_tool=%s | reasoning=%s | valid=%s",
-            llm_decision.get("next_tool", "?"),
-            llm_decision.get("reasoning", "?")[:120],
-            validation["is_valid"],
-        )
-        if not validation["is_valid"]:
-            logger.warning(
-                "LLM suggestion rejected: %s → falling back to FSM",
-                validation["rejection_reason"],
+        print(f"[ORCHESTRATION] Step 2: Validating LLM decision...")
+        validation = _validate_decision(llm_decision, context)
+        if validation["is_valid"]:
+            next_tool = llm_decision["next_tool"]
+            print(f"[ORCHESTRATION] LLM decided: next_tool={next_tool}")
+            print(f"[ORCHESTRATION] Reasoning: {llm_decision.get('reasoning', '?')[:120]}")
+            logger.info(
+                "LLM decided: next_tool=%s | reasoning=%s",
+                next_tool,
+                llm_decision.get("reasoning", "?")[:120],
             )
+        else:
+            # LLM gave an invalid decision — use deterministic fallback
+            print(f"[ORCHESTRATION] [VALIDATION] LLM decision REJECTED: {validation['rejection_reason']}")
+            logger.warning(
+                "LLM decision rejected (%s) — using deterministic fallback for stage=%s",
+                validation["rejection_reason"], stage,
+            )
+            next_tool = _deterministic_fallback(context)
     else:
-        logger.info("LLM advisor unavailable for stage=%s → using FSM", stage)
+        # LLM unavailable — use deterministic fallback
+        print(f"[ORCHESTRATION] LLM returned no decision — using deterministic fallback")
+        logger.warning("LLM returned no decision for stage=%s — using deterministic fallback", stage)
+        next_tool = _deterministic_fallback(context)
 
-    # ── Step 4: Execute via FSM (the authority) ──
-    # The FSM always runs. LLM reasoning is attached for observability.
-    result = _fsm_execute(context)
+    print(f"[ORCHESTRATION] Next Tool: {next_tool}")
 
-    # Attach LLM reasoning to result for downstream observability
-    if llm_decision and validation["is_valid"]:
+    # ── Step 3: Final validation gate (always enforced) ──
+    print(f"[ORCHESTRATION] Step 3: Final validation gate...")
+    allowed = _ALLOWED_TRANSITIONS.get(stage, set())
+    if next_tool not in allowed:
+        print(f"[ORCHESTRATION] [ERROR] BLOCKED: '{next_tool}' not allowed from stage '{stage}'. Allowed: {allowed}")
+        logger.error(
+            "BLOCKED: tool '%s' not in allowed transitions for stage '%s'. Allowed: %s",
+            next_tool, stage, allowed,
+        )
+        return {
+            "stage": "ERROR",
+            "data": None,
+            "message": f"Invalid transition: '{next_tool}' not allowed from stage '{stage}'. "
+                       f"Allowed: {allowed}",
+        }
+
+    precondition_error = _check_preconditions(next_tool, context)
+    if precondition_error:
+        print(f"[ORCHESTRATION] [ERROR] BLOCKED: precondition failed — {precondition_error}")
+        logger.error("BLOCKED: precondition failed — %s", precondition_error)
+        return {
+            "stage": "ERROR",
+            "data": None,
+            "message": f"Precondition failed: {precondition_error}",
+        }
+
+    print(f"[ORCHESTRATION] [VALIDATION] Passed — executing tool '{next_tool}'")
+
+    # ── Step 4: Execute the validated tool ──
+    print(f"[ORCHESTRATION] Step 4: Executing tool '{next_tool}'...")
+    result = _execute_tool(next_tool, context)
+
+    # Attach LLM reasoning for observability
+    if llm_decision:
         result["_llm_reasoning"] = llm_decision.get("reasoning", "")
-        result["_llm_aligned"] = True
-    elif llm_decision:
-        result["_llm_reasoning"] = llm_decision.get("reasoning", "")
-        result["_llm_aligned"] = False
-        result["_llm_rejection"] = validation["rejection_reason"]
+        result["_llm_tool"] = llm_decision.get("next_tool", "")
+
+    print(f"[ORCHESTRATION] Result stage: {result.get('stage')}")
+    print(f"[ORCHESTRATION] ========== handle_query_v2 DONE ==========")
+    print(f"{'='*60}\n")
 
     return result
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LLM ADVISOR LAYER
+# LLM DECISION LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _llm_advise(context: dict) -> dict | None:
-    """Ask the LLM what the next tool should be.
+def _get_llm_decision(context: dict) -> dict | None:
+    """Query the LLM orchestrator for the next tool decision.
 
     Returns parsed dict {"next_tool": ..., "reasoning": ...} or None on failure.
-    This function NEVER raises — all failures return None (safe fallback).
+    This function NEVER raises — all failures return None.
     """
     try:
-        # Build a compact context snapshot for the LLM
-        # Truncate large fields to avoid token waste
+        print("[FUNCTION] Entering _get_llm_decision")
         metadata_summary = _summarize_metadata(context.get("metadata", []))
+        attempt_count = context.get("clarification_attempt_count", 0)
+        has_invalid = context.get("has_invalid_responses", False)
+
+        print(f"[ORCHESTRATION] [LLM CALL] Querying orchestrator LLM | stage={context.get('current_stage', 'START')} | attempts={attempt_count} | has_invalid={has_invalid}")
 
         prompt = ORCHESTRATOR_PROMPT.format(
             current_stage=context.get("current_stage", "START"),
@@ -143,23 +188,34 @@ def _llm_advise(context: dict) -> dict | None:
             is_confirmed=context.get("is_confirmed", False),
             code="[present]" if context.get("code") else "[absent]",
             result="[present]" if context.get("result") else "[absent]",
+            clarification_attempt_count=attempt_count,
+            has_invalid_responses=has_invalid,
         )
 
-        response = call_llm(prompt)
+        response = call_llm(prompt, caller="orchestrator_decision")
         if not response or not response.strip():
+            print("[ORCHESTRATION] [LLM CALL] LLM returned empty response")
             logger.debug("LLM returned empty response")
+            print("[FUNCTION] Exiting _get_llm_decision | result=None")
             return None
 
-        # Parse strict JSON
-        return _parse_llm_json(response)
+        parsed = _parse_llm_json(response)
+        if parsed:
+            print(f"[ORCHESTRATION] [LLM CALL] LLM decision parsed: next_tool={parsed.get('next_tool')}")
+        else:
+            print("[ORCHESTRATION] [LLM CALL] Failed to parse LLM decision JSON")
+        print("[FUNCTION] Exiting _get_llm_decision")
+        return parsed
 
     except Exception as e:
-        logger.debug("LLM advisor error: %s", e)
+        print(f"[ORCHESTRATION] [ERROR] LLM decision error: {e}")
+        logger.debug("LLM decision error: %s", e)
+        print("[FUNCTION] Exiting _get_llm_decision | result=None (error)")
         return None
 
 
 def _parse_llm_json(response: str) -> dict | None:
-    """Parse LLM response as JSON. Returns None on any failure."""
+    """Parse LLM response as strict JSON. Returns None on any failure."""
     text = response.strip()
 
     # Direct parse
@@ -199,7 +255,7 @@ def _summarize_metadata(metadata: list) -> str:
     if not metadata:
         return "[no metadata]"
     cols = []
-    for col in metadata[:20]:  # Cap at 20 columns
+    for col in metadata[:20]:
         name = col.get("name", "?")
         ptype = col.get("predicted_type", "?")
         cols.append(f"{name}({ptype})")
@@ -217,21 +273,26 @@ def _truncate(text: str, max_len: int) -> str:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# VALIDATION LAYER
+# VALIDATION LAYER (MANDATORY — guards every execution)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _validate_llm_decision(decision: dict | None, context: dict) -> dict:
-    """Validate LLM suggestion against allowed transitions and state requirements.
+def _validate_decision(decision: dict | None, context: dict) -> dict:
+    """Validate LLM decision against allowed transitions and preconditions.
 
     Returns:
         {"is_valid": bool, "rejection_reason": str}
     """
+    print("[FUNCTION] Entering _validate_decision")
     if decision is None:
+        print("[VALIDATION] Decision is None")
+        print("[FUNCTION] Exiting _validate_decision")
         return {"is_valid": False, "rejection_reason": "LLM returned no decision"}
 
     next_tool = decision.get("next_tool", "")
     if not next_tool or not isinstance(next_tool, str):
+        print(f"[VALIDATION] Missing or invalid next_tool: {next_tool!r}")
+        print("[FUNCTION] Exiting _validate_decision")
         return {"is_valid": False, "rejection_reason": "Missing or invalid next_tool"}
 
     stage = context.get("current_stage", "START")
@@ -239,9 +300,13 @@ def _validate_llm_decision(decision: dict | None, context: dict) -> dict:
     # Check transition legality
     allowed = _ALLOWED_TRANSITIONS.get(stage)
     if allowed is None:
+        print(f"[VALIDATION] Unknown stage: {stage}")
+        print("[FUNCTION] Exiting _validate_decision")
         return {"is_valid": False, "rejection_reason": f"Unknown stage: {stage}"}
 
     if next_tool not in allowed:
+        print(f"[VALIDATION] Transition rejected: '{next_tool}' not in {allowed}")
+        print("[FUNCTION] Exiting _validate_decision")
         return {
             "is_valid": False,
             "rejection_reason": f"'{next_tool}' not allowed from stage '{stage}'. "
@@ -251,13 +316,17 @@ def _validate_llm_decision(decision: dict | None, context: dict) -> dict:
     # State precondition checks
     precondition_error = _check_preconditions(next_tool, context)
     if precondition_error:
+        print(f"[VALIDATION] Precondition failed: {precondition_error}")
+        print("[FUNCTION] Exiting _validate_decision")
         return {"is_valid": False, "rejection_reason": precondition_error}
 
+    print(f"[VALIDATION] Decision valid: {next_tool}")
+    print("[FUNCTION] Exiting _validate_decision")
     return {"is_valid": True, "rejection_reason": ""}
 
 
 def _check_preconditions(next_tool: str, context: dict) -> str | None:
-    """Check if required state exists for the suggested tool.
+    """Check if required state exists for the tool.
 
     Returns error string if precondition fails, None if OK.
     """
@@ -283,17 +352,58 @@ def _check_preconditions(next_tool: str, context: dict) -> str | None:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# FSM EXECUTION (THE AUTHORITY)
+# DETERMINISTIC FALLBACK (only when LLM fails or is rejected)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _fsm_execute(context: dict) -> dict:
-    """Deterministic state-machine orchestrator — the authority layer.
+def _deterministic_fallback(context: dict) -> str:
+    """Minimal deterministic fallback: maps stage → the single obvious next tool.
 
-    This is the original FSM logic, now isolated as a function.
-    It always runs regardless of LLM advice. The LLM layer is purely advisory.
+    This is NOT an FSM. It only fires when the LLM is unavailable or returns
+    an invalid decision. Each stage has exactly one safe default tool.
     """
+    print("[FUNCTION] Entering _deterministic_fallback")
     stage = context.get("current_stage", "START")
+
+    _FALLBACK_MAP = {
+        "START":                    "classify_query",
+        "NEEDS_CLARIFICATION":      "generate_clarifications",
+        "AWAITING_PLAN":            "generate_plan",
+        "PLAN_CONFIRMED":           "generate_code",
+        "READY_TO_EXECUTE":         "execute_code",
+        "SAVE_WORKFLOW":            "extract_workflow_semantics",
+        "WORKFLOW_SELECTED":        "map_fields",
+        "WORKFLOW_EXECUTE":         "execute_workflow",
+        "COMPLETED":                "done",
+        "INFORMATIONAL":            "informational",
+        "CLARIFICATION_FAILED":     "stop",
+    }
+
+    tool = _FALLBACK_MAP.get(stage)
+    if tool:
+        print(f"[ORCHESTRATION] Deterministic fallback: stage={stage} → tool={tool}")
+        logger.info("Deterministic fallback: stage=%s → tool=%s", stage, tool)
+        print("[FUNCTION] Exiting _deterministic_fallback")
+        return tool
+
+    print(f"[ORCHESTRATION] [ERROR] No fallback for unknown stage: {stage}")
+    logger.error("No fallback for unknown stage: %s", stage)
+    print("[FUNCTION] Exiting _deterministic_fallback")
+    return "done"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# EXECUTION LAYER (tool dispatch)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _execute_tool(next_tool: str, context: dict) -> dict:
+    """Execute the validated tool and return the result.
+
+    This layer ONLY executes — it does NOT decide. The decision was already
+    made by the LLM and validated by Python.
+    """
+    print(f"[FUNCTION] Entering _execute_tool | tool={next_tool}")
     user_query = context.get("user_query", "")
     metadata = context.get("metadata", [])
     clarifications = context.get("clarifications", {})
@@ -305,8 +415,9 @@ def _fsm_execute(context: dict) -> dict:
     column_names = _extract_column_names(metadata)
     attempt_count = context.get("clarification_attempt_count", 0)
 
-    # ── STAGE: START ─────────────────────────────────────
-    if stage == "START":
+    # ── classify_query ──
+    if next_tool == "classify_query":
+        print("[EXECUTION] Executing tool: classify_query")
         classification = classify_query(user_query, metadata)
         if classification == "informational":
             return {
@@ -314,7 +425,6 @@ def _fsm_execute(context: dict) -> dict:
                 "data": _answer_informational(user_query, metadata),
                 "message": "Here is the information you requested."
             }
-        # Analytical → go to clarification (attempt 0)
         questions = generate_clarifications(
             user_query, metadata, data_summary, edge_cases,
             attempt_count=0, previous_questions=[],
@@ -333,91 +443,46 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Please answer these clarifications to proceed."
         }
 
-    # ── STAGE: CLARIFICATION_FAILED ──────────────────────
-    if stage == "CLARIFICATION_FAILED":
+    # ── generate_clarifications ──
+    if next_tool == "generate_clarifications":
+        print("[EXECUTION] Executing tool: generate_clarifications")
+        previous_questions = context.get("previous_clarification_questions", [])
+        questions = generate_clarifications(
+            user_query, metadata, data_summary, edge_cases,
+            attempt_count=attempt_count, previous_questions=previous_questions,
+        )
+        if not questions:
+            return {
+                "stage": "PLANNING",
+                "data": generate_plan(user_query, metadata, clarifications),
+                "message": "No further clarifications needed. Would you like to proceed?"
+            }
         return {
-            "stage": "CLARIFICATION_FAILED",
-            "data": {
-                "reason": "Maximum clarification attempts reached with invalid responses.",
-                "suggestions": [
-                    "Rephrase your query to be more specific.",
-                    "Try a simpler analysis that requires fewer assumptions.",
-                    "Check the dataset profile in the sidebar for available columns.",
-                ],
-            },
-            "message": "Required data is missing or unclear. This query cannot be executed reliably. "
-                       "Please rephrase your query or try a different analysis."
+            "stage": "CLARIFICATION",
+            "data": questions,
+            "clarification_attempt_count": attempt_count + 1,
+            "previous_clarification_questions": questions,
+            "message": "Please answer these clarifications to proceed."
         }
 
-    # ── STAGE: AWAITING_PLAN ─────────────────────────────
-    if stage == "AWAITING_PLAN":
-        if clarifications:
-            # Step 1: Detect nonsensical / refusal responses
-            response_quality = detect_invalid_responses(clarifications, column_names)
-            if response_quality["has_invalid"]:
-                if attempt_count >= _MAX_CLARIFICATION_ATTEMPTS:
-                    return {
-                        "stage": "CLARIFICATION_FAILED",
-                        "data": {
-                            "reason": "Maximum clarification attempts reached with invalid responses.",
-                            "invalid_answers": response_quality["invalid_answers"],
-                            "suggestions": [
-                                "Rephrase your query to be more specific.",
-                                "Try a simpler analysis that requires fewer assumptions.",
-                                "Check the dataset profile in the sidebar for available columns.",
-                            ],
-                        },
-                        "message": "Required data is missing or unclear. This query cannot be executed reliably. "
-                                   "Please rephrase your query or try a different analysis."
-                    }
-                return {
-                    "stage": "CLARIFICATION_INVALID",
-                    "data": {
-                        "issues": [
-                            {"question": ia["question"], "user_answer": ia["user_answer"],
-                             "problem": ia["reason"], "suggestion": "Please provide a specific, relevant answer."}
-                            for ia in response_quality["invalid_answers"]
-                        ],
-                        "available_columns": column_names,
-                        "original_answers": clarifications,
-                        "attempt_count": attempt_count,
-                    },
-                    "message": "Some of your answers appear invalid or unclear. Please correct them. "
-                               f"(Attempt {attempt_count} of {_MAX_CLARIFICATION_ATTEMPTS})"
-                }
+    # ── validate_clarifications (AWAITING_PLAN with clarifications) ──
+    if next_tool == "validate_clarifications":
+        print("[EXECUTION] Executing tool: validate_clarifications")
+        return _handle_clarification_validation(context, clarifications, column_names, attempt_count,
+                                                 user_query, metadata)
 
-            # Step 2: Validate column references
-            validation = validate_clarification_answers(
-                user_query, clarifications, metadata
+    # ── generate_plan ──
+    if next_tool == "generate_plan":
+        print("[EXECUTION] Executing tool: generate_plan")
+        # If clarifications exist, validate them first
+        if clarifications:
+            validation_result = _handle_clarification_validation(
+                context, clarifications, column_names, attempt_count,
+                user_query, metadata,
             )
-            if not validation.get("is_valid", False):
-                if attempt_count >= _MAX_CLARIFICATION_ATTEMPTS:
-                    return {
-                        "stage": "CLARIFICATION_FAILED",
-                        "data": {
-                            "reason": "Maximum clarification attempts reached. Answers still reference invalid columns.",
-                            "issues": validation.get("issues", []),
-                            "suggestions": [
-                                "Rephrase your query to be more specific.",
-                                "Use exact column names from the dataset.",
-                                "Check the dataset profile in the sidebar for available columns.",
-                            ],
-                        },
-                        "message": "Required data is missing or unclear. This query cannot be executed reliably. "
-                                   "Please rephrase your query or try a different analysis."
-                    }
-                issues = validation.get("issues", [])
-                return {
-                    "stage": "CLARIFICATION_INVALID",
-                    "data": {
-                        "issues": issues,
-                        "available_columns": column_names,
-                        "original_answers": clarifications,
-                        "attempt_count": attempt_count,
-                    },
-                    "message": "Some of your answers don't match the dataset. Please correct them. "
-                               f"(Attempt {attempt_count} of {_MAX_CLARIFICATION_ATTEMPTS})"
-                }
+            # If validation returned a non-PLANNING stage, propagate it
+            if validation_result["stage"] not in ("PLANNING",):
+                return validation_result
 
         plan_text = generate_plan(user_query, metadata, clarifications)
         return {
@@ -426,8 +491,9 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Would you like to proceed with this plan or make any changes?"
         }
 
-    # ── STAGE: PLAN_CONFIRMED ────────────────────────────
-    if stage == "PLAN_CONFIRMED":
+    # ── generate_code ──
+    if next_tool == "generate_code":
+        print("[EXECUTION] Executing tool: generate_code")
         instructions = generate_code_instructions(
             plan, metadata, clarifications, file_path
         )
@@ -438,8 +504,10 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Code is ready for execution."
         }
 
-    # ── STAGE: READY_TO_EXECUTE ──────────────────────────
-    if stage == "READY_TO_EXECUTE":
+    # ── execute_code ──
+    if next_tool == "execute_code":
+        print("[EXECUTION] Executing tool: execute_code")
+        print("[EXECUTION] Running generated code...")
         result = execute_code(code)
         if result.get("error"):
             return {
@@ -453,8 +521,9 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Execution complete. Would you like to save this as a reusable workflow?"
         }
 
-    # ── STAGE: SAVE_WORKFLOW ─────────────────────────────
-    if stage == "SAVE_WORKFLOW":
+    # ── extract_workflow_semantics ──
+    if next_tool == "extract_workflow_semantics":
+        print("[EXECUTION] Executing tool: extract_workflow_semantics")
         semantics = extract_workflow_semantics(plan, code, clarifications)
         return {
             "stage": "WORKFLOW_SEMANTICS",
@@ -462,8 +531,9 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Workflow semantics extracted. Ready to save."
         }
 
-    # ── WORKFLOW FLOW: WORKFLOW_SELECTED ──────────────────
-    if stage == "WORKFLOW_SELECTED":
+    # ── map_fields ──
+    if next_tool == "map_fields":
+        print("[EXECUTION] Executing tool: map_fields")
         workflow = context.get("selected_workflow", {})
         required_fields = workflow.get("semantic_requirements", [])
         mapping_result = map_fields(required_fields, column_names)
@@ -491,8 +561,9 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Mappings resolved. Ready to execute workflow."
         }
 
-    # ── WORKFLOW FLOW: WORKFLOW_EXECUTE ───────────────────
-    if stage == "WORKFLOW_EXECUTE":
+    # ── execute_workflow ──
+    if next_tool == "execute_workflow":
+        print("[EXECUTION] Executing tool: execute_workflow")
         workflow = context.get("selected_workflow", {})
         field_mappings = context.get("workflow_mappings", {})
         workflow_code = workflow.get("code", "")
@@ -515,11 +586,127 @@ def _fsm_execute(context: dict) -> dict:
             "message": "Workflow execution complete."
         }
 
-    # ── FALLBACK ─────────────────────────────────────────
+    # ── done ──
+    if next_tool == "done":
+        return {
+            "stage": "COMPLETED",
+            "data": None,
+            "message": "Orchestration complete."
+        }
+
+    # ── informational ──
+    if next_tool == "informational":
+        return {
+            "stage": "INFORMATIONAL",
+            "data": _answer_informational(user_query, metadata),
+            "message": "Here is the information you requested."
+        }
+
+    # ── stop (clarification failed) ──
+    if next_tool == "stop":
+        return {
+            "stage": "CLARIFICATION_FAILED",
+            "data": {
+                "reason": "Maximum clarification attempts reached with invalid responses.",
+                "suggestions": [
+                    "Rephrase your query to be more specific.",
+                    "Try a simpler analysis that requires fewer assumptions.",
+                    "Check the dataset profile in the sidebar for available columns.",
+                ],
+            },
+            "message": "Required data is missing or unclear. This query cannot be executed reliably. "
+                       "Please rephrase your query or try a different analysis."
+        }
+
+    # ── Unknown tool (should never reach here due to validation) ──
     return {
         "stage": "ERROR",
         "data": None,
-        "message": f"Unknown stage: {stage}. Cannot proceed."
+        "message": f"Unknown tool: {next_tool}. Cannot proceed."
+    }
+
+
+def _handle_clarification_validation(_context, clarifications, column_names,
+                                      attempt_count, user_query, metadata):
+    """Validate clarification answers. Returns appropriate stage result."""
+    print(f"[FUNCTION] Entering _handle_clarification_validation | attempt={attempt_count}")
+    # Step 1: Detect nonsensical / refusal responses
+    print("[VALIDATION] Step 1: Detecting invalid/refusal responses")
+    response_quality = detect_invalid_responses(clarifications, column_names)
+    if response_quality["has_invalid"]:
+        print(f"[VALIDATION] Invalid responses detected: {len(response_quality['invalid_answers'])} invalid answers")
+        if attempt_count >= _MAX_CLARIFICATION_ATTEMPTS:
+            return {
+                "stage": "CLARIFICATION_FAILED",
+                "data": {
+                    "reason": "Maximum clarification attempts reached with invalid responses.",
+                    "invalid_answers": response_quality["invalid_answers"],
+                    "suggestions": [
+                        "Rephrase your query to be more specific.",
+                        "Try a simpler analysis that requires fewer assumptions.",
+                        "Check the dataset profile in the sidebar for available columns.",
+                    ],
+                },
+                "message": "Required data is missing or unclear. This query cannot be executed reliably. "
+                           "Please rephrase your query or try a different analysis."
+            }
+        return {
+            "stage": "CLARIFICATION_INVALID",
+            "data": {
+                "issues": [
+                    {"question": ia["question"], "user_answer": ia["user_answer"],
+                     "problem": ia["reason"], "suggestion": "Please provide a specific, relevant answer."}
+                    for ia in response_quality["invalid_answers"]
+                ],
+                "available_columns": column_names,
+                "original_answers": clarifications,
+                "attempt_count": attempt_count,
+            },
+            "message": "Some of your answers appear invalid or unclear. Please correct them. "
+                       f"(Attempt {attempt_count} of {_MAX_CLARIFICATION_ATTEMPTS})"
+        }
+
+    print("[VALIDATION] Step 2: Validating column references")
+    # Step 2: Validate column references
+    validation = validate_clarification_answers(
+        user_query, clarifications, metadata
+    )
+    if not validation.get("is_valid", False):
+        if attempt_count >= _MAX_CLARIFICATION_ATTEMPTS:
+            return {
+                "stage": "CLARIFICATION_FAILED",
+                "data": {
+                    "reason": "Maximum clarification attempts reached. Answers still reference invalid columns.",
+                    "issues": validation.get("issues", []),
+                    "suggestions": [
+                        "Rephrase your query to be more specific.",
+                        "Use exact column names from the dataset.",
+                        "Check the dataset profile in the sidebar for available columns.",
+                    ],
+                },
+                "message": "Required data is missing or unclear. This query cannot be executed reliably. "
+                           "Please rephrase your query or try a different analysis."
+            }
+        issues = validation.get("issues", [])
+        return {
+            "stage": "CLARIFICATION_INVALID",
+            "data": {
+                "issues": issues,
+                "available_columns": column_names,
+                "original_answers": clarifications,
+                "attempt_count": attempt_count,
+            },
+            "message": "Some of your answers don't match the dataset. Please correct them. "
+                       f"(Attempt {attempt_count} of {_MAX_CLARIFICATION_ATTEMPTS})"
+        }
+
+    # Validation passed — proceed to planning
+    print("[VALIDATION] All validations passed — proceeding to planning")
+    print("[FUNCTION] Exiting _handle_clarification_validation")
+    return {
+        "stage": "PLANNING",
+        "data": generate_plan(user_query, metadata, clarifications),
+        "message": "Would you like to proceed with this plan or make any changes?"
     }
 
 

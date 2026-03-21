@@ -76,6 +76,7 @@ def add_message(role: str, content: str, msg_type: str = "text", data=None):
 # ── Helper: Save uploaded file to disk ─────────────────────
 def save_uploaded_file(uploaded_file) -> tuple:
     """Save Streamlit UploadedFile to uploads/ dir. Returns (file_type, local_path)."""
+    print(f"[FUNCTION] Entering save_uploaded_file | file={uploaded_file.name}")
     file_id = str(uuid.uuid4())
     filename = uploaded_file.name.lower()
 
@@ -92,19 +93,27 @@ def save_uploaded_file(uploaded_file) -> tuple:
             local_path = os.path.join(_UPLOAD_DIR, f"{file_id}{suffix}")
             with open(local_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
+            print(f"[FUNCTION] Exiting save_uploaded_file | type={ftype} | path={local_path}")
             return ftype, local_path, file_id
 
+    print(f"[FUNCTION] Exiting save_uploaded_file | unsupported file type")
     return None, None, None
 
 
 # ── Helper: Extract metadata (same logic as main.py) ──────
 def extract_metadata(file_type: str, local_path: str) -> dict:
     """Extract metadata using standardized output for all types."""
+    print(f"[FUNCTION] Entering extract_metadata | type={file_type}")
     if file_type in ("csv", "excel", "json"):
-        return extract_structured_metadata(local_path)
+        result = extract_structured_metadata(local_path)
+        print(f"[FUNCTION] Exiting extract_metadata | columns={len(result.get('columns', []))}")
+        return result
     elif file_type == "pdf":
         # process_pdf_file now returns standardized format directly
-        return process_pdf_file(local_path)
+        result = process_pdf_file(local_path)
+        print(f"[FUNCTION] Exiting extract_metadata | pdf processed")
+        return result
+    print("[FUNCTION] Exiting extract_metadata | unsupported type, returning empty")
     return {"columns": [], "data_summary": {}, "edge_cases": {}}
 
 
@@ -127,6 +136,7 @@ with st.sidebar:
     )
 
     if uploaded_files and not st.session_state.uploaded:
+        print(f"\n[STAGE] UPLOAD | [FUNCTION] Processing {len(uploaded_files)} file(s)")
         with st.spinner(f"Processing {len(uploaded_files)} file(s) & extracting metadata..."):
             # Step 1: Save all files to disk
             saved = []
@@ -183,6 +193,7 @@ with st.sidebar:
                     merged_summary = first["result"].get("data_summary", {})
                     merged_edge_cases = first["result"].get("edge_cases", {})
 
+                print(f"[STAGE] UPLOAD | [FUNCTION] Metadata extraction complete | {len(all_columns)} columns from {len(all_sources)} sources")
                 st.session_state.metadata = all_columns
                 st.session_state.data_summary = merged_summary
                 st.session_state.edge_cases = merged_edge_cases
@@ -417,12 +428,14 @@ elif st.session_state.stage == "NEW_QUERY":
         }
 
         # Call orchestrator
+        print(f"\n[STAGE] NEW_QUERY | [ORCHESTRATION] Calling handle_query_v2 | query={query[:80]}")
         with st.spinner("Analyzing your query..."):
             result = handle_query_v2(st.session_state.context)
 
         stage = result.get("stage")
         data = result.get("data")
         message = result.get("message", "")
+        print(f"[STAGE] NEW_QUERY | [ORCHESTRATION] Result stage: {stage}")
 
         if stage == "INFORMATIONAL":
             add_message("system", message, msg_type="result", data={"result": data})
@@ -475,11 +488,13 @@ elif st.session_state.stage == "CLARIFICATION":
             st.session_state.context["clarifications"] = answers
             st.session_state.context["current_stage"] = "AWAITING_PLAN"
 
+            print(f"\n[STAGE] CLARIFICATION | [ORCHESTRATION] Submitting clarification answers")
             with st.spinner("Validating answers & generating plan..."):
                 result = handle_query_v2(st.session_state.context)
 
             stage = result.get("stage")
             data = result.get("data")
+            print(f"[STAGE] CLARIFICATION | [ORCHESTRATION] Result stage: {stage}")
 
             if stage == "CLARIFICATION_FAILED":
                 # Terminal — max attempts exhausted or unresolvable
@@ -528,8 +543,10 @@ elif st.session_state.stage == "PLAN_REVIEW":
             st.session_state.context["is_confirmed"] = True
             st.session_state.context["current_stage"] = "PLAN_CONFIRMED"
 
+            print(f"\n[STAGE] PLAN_REVIEW | [ORCHESTRATION] Plan approved, generating code")
             with st.spinner("Generating code..."):
                 result = handle_query_v2(st.session_state.context)
+            print(f"[STAGE] PLAN_REVIEW | [ORCHESTRATION] Result stage: {result.get('stage')}")
 
             data = result.get("data", "")
             add_message("system", data, msg_type="code")
@@ -570,6 +587,7 @@ elif st.session_state.stage == "EXECUTING":
 
     code = st.session_state.context.get("code", "")
 
+    print(f"\n[STAGE] EXECUTING | [EXECUTION] Starting live execution | code_length={len(code)}")
     st.subheader("Live Execution")
 
     # Status indicator
@@ -595,8 +613,10 @@ elif st.session_state.stage == "EXECUTING":
 
     # Run REPL execution
     status_container.warning("Executing code...")
+    print("[STAGE] EXECUTING | [EXECUTION] Running REPL execution...")
 
     repl_result = execute_code_repl(code)
+    print(f"[STAGE] EXECUTING | [EXECUTION] REPL result: status={repl_result['status']}")
 
     # Render final state
     steps = repl_result.get("steps", [])
@@ -679,6 +699,7 @@ elif st.session_state.stage == "EXECUTION_DONE":
     with col2:
         if st.button("Save Workflow", type="primary", use_container_width=True):
             if wf_desc.strip():
+                print(f"\n[STAGE] WORKFLOW_SAVE | [FUNCTION] Saving workflow: {wf_desc[:60]}")
                 with st.spinner("Extracting workflow semantics..."):
                     ctx = st.session_state.context
                     semantics = extract_workflow_semantics(
@@ -829,7 +850,9 @@ elif st.session_state.stage == "WORKFLOW_EXECUTE":
     error_container = st.empty()
 
     status_container.warning("Executing workflow...")
+    print(f"\n[STAGE] WORKFLOW_EXECUTE | [EXECUTION] Running workflow code | length={len(workflow_code)}")
     repl_result = execute_code_repl(workflow_code)
+    print(f"[STAGE] WORKFLOW_EXECUTE | [EXECUTION] Workflow result: status={repl_result['status']}")
 
     steps = repl_result.get("steps", [])
     logs = repl_result.get("logs", [])

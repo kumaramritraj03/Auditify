@@ -2,8 +2,8 @@ import pandas as pd
 import io
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from agents import infer_column_metadata, infer_document_metadata, generate_data_summary
+import re
+from agents import infer_document_metadata, generate_data_summary
 
 
 # ── Supported structured extensions ────────────────────────
@@ -14,8 +14,285 @@ _STRUCTURED_EXTENSIONS = {
     ".json": "json",
 }
 
-# Max threads for parallel LLM calls (per-column metadata inference)
-_MAX_LLM_THREADS = 6
+# ── Name-based keyword patterns for semantic type detection ──
+_ID_PATTERNS = re.compile(
+    r"(^id$|_id$|^id_|ID$|_ID$|_key$|_code$|number$|_num$|_no$|^key_|^pk_|^fk_|^ref_)",
+    re.IGNORECASE,
+)
+_DATE_PATTERNS = re.compile(
+    r"(date|time|timestamp|_dt$|_ts$|created|updated|modified|period|year|month|day|quarter|fiscal)",
+    re.IGNORECASE,
+)
+_AMOUNT_PATTERNS = re.compile(
+    r"(amount|price|cost|revenue|total|sum|fee|tax|discount|salary|wage|balance|bill|spend|budget|payment|charge|rate)",
+    re.IGNORECASE,
+)
+_NAME_PATTERNS = re.compile(
+    r"(name|title|label|description|desc$|comment|note|address|email|phone|city|state|country|street)",
+    re.IGNORECASE,
+)
+_CATEGORY_PATTERNS = re.compile(
+    r"(category|type|status|level|tier|group|class|segment|region|department|channel|mode|method|kind|gender|brand|vendor|supplier|product)",
+    re.IGNORECASE,
+)
+_QUANTITY_PATTERNS = re.compile(
+    r"(quantity|qty|count|units|volume|weight|size|length|width|height|stock|inventory)",
+    re.IGNORECASE,
+)
+_PERCENTAGE_PATTERNS = re.compile(
+    r"(percent|pct|ratio|rate|margin|share|proportion|_%$)",
+    re.IGNORECASE,
+)
+_BOOLEAN_PATTERNS = re.compile(
+    r"(^is_|^has_|^can_|^flag|^active|^enabled|^deleted|^verified|^approved)",
+    re.IGNORECASE,
+)
+
+
+def _infer_column_type_local(col_name: str, series: pd.Series, samples: list) -> dict:
+    """Deterministic column type inference using pandas dtype + column name patterns + value analysis.
+
+    Returns the same schema as the old LLM-based infer_column_metadata:
+    {"predicted_type": ..., "predicted_description": ..., "confidence": ...}
+    """
+    dtype = series.dtype
+    dtype_str = str(dtype)
+    n_unique = series.nunique()
+    n_total = series.dropna().shape[0]
+    unique_ratio = n_unique / n_total if n_total > 0 else 0.0
+
+    # ── 1. Boolean detection (dtype or name) ──
+    if dtype == "bool" or _BOOLEAN_PATTERNS.search(col_name):
+        if dtype == "bool":
+            return {"predicted_type": "boolean", "predicted_description": f"Boolean flag: {col_name}", "confidence": 0.95}
+        # Name-based boolean, check if values look boolean
+        unique_vals = set(str(v).lower().strip() for v in samples)
+        bool_vals = {"true", "false", "yes", "no", "1", "0", "y", "n", "t", "f"}
+        if unique_vals.issubset(bool_vals):
+            return {"predicted_type": "boolean", "predicted_description": f"Boolean flag: {col_name}", "confidence": 0.90}
+
+    # ── 2. Date/time detection ──
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return {"predicted_type": "date", "predicted_description": f"Timestamp/date field: {col_name}", "confidence": 0.95}
+    if _DATE_PATTERNS.search(col_name):
+        # Try parsing samples as dates
+        parsed = 0
+        for s in samples[:6]:
+            try:
+                pd.to_datetime(s)
+                parsed += 1
+            except (ValueError, TypeError):
+                pass
+        if parsed >= len(samples) * 0.5:
+            return {"predicted_type": "date", "predicted_description": f"Date/time field: {col_name}", "confidence": 0.85}
+        # Name matches but values don't parse — still likely date-related
+        return {"predicted_type": "date", "predicted_description": f"Likely date/time field: {col_name}", "confidence": 0.65}
+
+    # ── 3. ID detection ──
+    # Only classify as ID if the name matches ID patterns AND does NOT also match
+    # a value-type pattern (amount, quantity, percentage).  This prevents columns
+    # like "AmountPaid" (ends with "ID"-like suffix) from being misclassified.
+    if _ID_PATTERNS.search(col_name):
+        is_also_amount = _AMOUNT_PATTERNS.search(col_name)
+        is_also_quantity = _QUANTITY_PATTERNS.search(col_name)
+        is_also_percentage = _PERCENTAGE_PATTERNS.search(col_name)
+        if not (is_also_amount or is_also_quantity or is_also_percentage):
+            conf = 0.90 if unique_ratio > 0.8 else 0.75
+            return {"predicted_type": "id", "predicted_description": f"Identifier/key field: {col_name}", "confidence": conf}
+        # If it matches both ID and a value pattern, fall through to numeric/string checks
+        # which will classify it correctly based on dtype and the value pattern.
+
+    # ── 4. Numeric types ──
+    if pd.api.types.is_numeric_dtype(dtype):
+        # Percentage
+        if _PERCENTAGE_PATTERNS.search(col_name):
+            return {"predicted_type": "percentage", "predicted_description": f"Percentage/ratio metric: {col_name}", "confidence": 0.85}
+        # Amount/currency
+        if _AMOUNT_PATTERNS.search(col_name):
+            return {"predicted_type": "amount", "predicted_description": f"Monetary/amount value: {col_name}", "confidence": 0.90}
+        # Quantity
+        if _QUANTITY_PATTERNS.search(col_name):
+            return {"predicted_type": "quantity", "predicted_description": f"Quantity/count metric: {col_name}", "confidence": 0.85}
+        # Low cardinality numeric = possibly categorical (encoded)
+        if n_unique <= 10 and n_total > 20:
+            return {"predicted_type": "category", "predicted_description": f"Low-cardinality numeric (possibly encoded category): {col_name}", "confidence": 0.60}
+        # Generic numeric
+        return {"predicted_type": "numeric", "predicted_description": f"Numeric metric: {col_name}", "confidence": 0.75}
+
+    # ── 5. String/object types ──
+    if dtype == "object" or pd.api.types.is_string_dtype(dtype):
+        # Check if values look like dates even though dtype is string
+        parsed_dates = 0
+        for s in samples[:6]:
+            try:
+                pd.to_datetime(s)
+                parsed_dates += 1
+            except (ValueError, TypeError):
+                pass
+        if parsed_dates >= len(samples) * 0.7 and len(samples) >= 2:
+            return {"predicted_type": "date", "predicted_description": f"Date stored as text: {col_name}", "confidence": 0.80}
+
+        # Check for currency strings like "$1,200.00"
+        currency_count = sum(1 for s in samples if re.match(r"^[\$\u20ac\u00a3\u00a5\u20b9]?\s*[\d,]+\.?\d*$", str(s).strip()))
+        if currency_count >= len(samples) * 0.7 and _AMOUNT_PATTERNS.search(col_name):
+            return {"predicted_type": "amount", "predicted_description": f"Monetary amount (text format): {col_name}", "confidence": 0.80}
+
+        # Name patterns
+        if _NAME_PATTERNS.search(col_name):
+            return {"predicted_type": "name", "predicted_description": f"Name/text descriptor: {col_name}", "confidence": 0.85}
+
+        # Category patterns or low cardinality
+        if _CATEGORY_PATTERNS.search(col_name):
+            return {"predicted_type": "category", "predicted_description": f"Categorical field: {col_name}", "confidence": 0.85}
+
+        if unique_ratio < 0.5 and n_total > 5:
+            return {"predicted_type": "category", "predicted_description": f"Low-cardinality text (likely categorical): {col_name}", "confidence": 0.70}
+
+        if unique_ratio > 0.9:
+            return {"predicted_type": "name", "predicted_description": f"High-cardinality text field: {col_name}", "confidence": 0.65}
+
+        # Fallback for strings
+        return {"predicted_type": "text", "predicted_description": f"Text field: {col_name}", "confidence": 0.50}
+
+    # ── 6. Fallback ──
+    return {"predicted_type": "unknown", "predicted_description": f"Could not determine type for: {col_name}", "confidence": 0.0}
+
+
+def _build_issue_stack(df: pd.DataFrame, columns_metadata: list) -> list:
+    """Detect data quality issues deterministically from the sample data.
+
+    Returns a list of issue dicts that can be fed to the LLM summary call
+    for richer context-aware summary generation.
+    """
+    issues = []
+    total_rows = len(df)
+
+    for col_meta in columns_metadata:
+        col_name = col_meta["name"]
+        series = df[col_name] if col_name in df.columns else None
+        if series is None:
+            continue
+
+        # ── High missing ratio ──
+        missing_ratio = col_meta.get("missing_ratio", 0.0)
+        if missing_ratio > 0.3:
+            issues.append({
+                "type": "high_missing_values",
+                "column": col_name,
+                "severity": "high" if missing_ratio > 0.5 else "medium",
+                "detail": f"Column '{col_name}' has {missing_ratio:.0%} missing values in sample",
+            })
+
+        # ── Constant column (all same value) ──
+        if series.nunique() <= 1 and series.dropna().shape[0] > 0:
+            issues.append({
+                "type": "constant_column",
+                "column": col_name,
+                "severity": "low",
+                "detail": f"Column '{col_name}' has only 1 unique value — may be useless for analysis",
+            })
+
+        # ── Potential duplicates in ID columns ──
+        if col_meta.get("predicted_type") == "id":
+            dup_count = series.dropna().duplicated().sum()
+            if dup_count > 0:
+                issues.append({
+                    "type": "duplicate_ids",
+                    "column": col_name,
+                    "severity": "high",
+                    "detail": f"ID column '{col_name}' has {dup_count} duplicate values in sample — may not be a true primary key",
+                })
+
+        # ── Mixed types in object columns ──
+        if series.dtype == "object":
+            non_null = series.dropna()
+            if len(non_null) > 0:
+                numeric_count = sum(1 for v in non_null if _is_numeric_string(str(v)))
+                if 0 < numeric_count < len(non_null):
+                    issues.append({
+                        "type": "mixed_types",
+                        "column": col_name,
+                        "severity": "medium",
+                        "detail": f"Column '{col_name}' has mixed numeric/text values ({numeric_count}/{len(non_null)} numeric)",
+                    })
+
+        # ── Negative values in amount/quantity columns ──
+        if col_meta.get("predicted_type") in ("amount", "quantity") and pd.api.types.is_numeric_dtype(series):
+            neg_count = (series.dropna() < 0).sum()
+            if neg_count > 0:
+                issues.append({
+                    "type": "negative_values",
+                    "column": col_name,
+                    "severity": "medium",
+                    "detail": f"Column '{col_name}' has {neg_count} negative values — may indicate returns/adjustments or data error",
+                })
+
+        # ── Outlier detection for numeric columns ──
+        if pd.api.types.is_numeric_dtype(series) and series.dropna().shape[0] >= 5:
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            if iqr > 0:
+                outliers = ((series < q1 - 3 * iqr) | (series > q3 + 3 * iqr)).sum()
+                if outliers > 0:
+                    issues.append({
+                        "type": "outliers",
+                        "column": col_name,
+                        "severity": "low",
+                        "detail": f"Column '{col_name}' has {outliers} extreme outliers (beyond 3x IQR) in sample",
+                    })
+
+    # ── Dataset-level issues ──
+
+    # Multiple date columns
+    date_cols = [m["name"] for m in columns_metadata if m.get("predicted_type") == "date"]
+    if len(date_cols) > 1:
+        issues.append({
+            "type": "multiple_date_columns",
+            "column": ", ".join(date_cols),
+            "severity": "medium",
+            "detail": f"Multiple date columns detected ({', '.join(date_cols)}) — unclear which is primary time dimension",
+        })
+
+    # Multiple amount columns
+    amount_cols = [m["name"] for m in columns_metadata if m.get("predicted_type") in ("amount", "numeric")]
+    if len(amount_cols) > 1:
+        issues.append({
+            "type": "multiple_amount_columns",
+            "column": ", ".join(amount_cols),
+            "severity": "low",
+            "detail": f"Multiple numeric/amount columns detected ({', '.join(amount_cols)}) — may need disambiguation",
+        })
+
+    # Multiple ID columns
+    id_cols = [m["name"] for m in columns_metadata if m.get("predicted_type") == "id"]
+    if len(id_cols) > 1:
+        issues.append({
+            "type": "multiple_id_columns",
+            "column": ", ".join(id_cols),
+            "severity": "medium",
+            "detail": f"Multiple ID columns detected ({', '.join(id_cols)}) — unclear which is primary key vs foreign key",
+        })
+
+    # No clear primary key
+    if not id_cols:
+        issues.append({
+            "type": "no_primary_key",
+            "column": "",
+            "severity": "low",
+            "detail": "No ID/key column detected — may need to identify a unique row identifier",
+        })
+
+    return issues
+
+
+def _is_numeric_string(s: str) -> bool:
+    """Check if a string looks like a number."""
+    try:
+        float(s.replace(",", "").replace("$", "").replace("€", "").replace("£", ""))
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def extract_structured_metadata(file_path: str) -> dict:
@@ -69,22 +346,45 @@ def extract_structured_metadata(file_path: str) -> dict:
             "edge_cases": {"is_empty": True, "read_error": False, "has_headers": len(df.columns) > 0},
         }
 
-    # Step 3: Extract per-column metadata with stats + LLM inference (PARALLEL)
+    # Step 3: Extract per-column metadata with stats + deterministic inference (NO LLM)
     columns_metadata = _extract_column_metadata(df)
 
-    # Step 4: Generate holistic dataset context profile (audit perimeter)
+    # Step 4: Build issue_stack — deterministic data quality analysis
+    issue_stack = _build_issue_stack(df, columns_metadata)
+    if issue_stack:
+        print(f"[STAGE] METADATA | [VALIDATION] Detected {len(issue_stack)} data quality issues")
+        for iss in issue_stack:
+            print(f"[STAGE] METADATA | [VALIDATION]   {iss['severity'].upper()}: {iss['detail']}")
+
+    # Step 5: Generate holistic dataset context profile (audit perimeter) — SINGLE LLM CALL
+    # Now enriched with column metadata + issue_stack for better context
     column_headers = list(df.columns)
     sample_rows = df.head(5).to_dict(orient="records")
     data_types = {col: str(dtype) for col, dtype in df.dtypes.items()}
+
+    # Build column metadata summary for the LLM
+    column_metadata_summary = [
+        {
+            "name": cm["name"],
+            "predicted_type": cm["predicted_type"],
+            "predicted_description": cm["predicted_description"],
+            "confidence": cm["confidence"],
+            "missing_ratio": cm["missing_ratio"],
+            "unique_ratio": cm["unique_ratio"],
+        }
+        for cm in columns_metadata
+    ]
 
     data_summary = generate_data_summary(
         column_headers=column_headers,
         sample_rows=sample_rows,
         data_types=data_types,
         source_type=source_type,
+        column_metadata=column_metadata_summary,
+        issue_stack=issue_stack,
     )
 
-    # Step 5: Detect edge cases — record only, never fix
+    # Step 6: Detect edge cases — record only, never fix
     edge_cases = _detect_edge_cases(df, columns_metadata, data_summary)
 
     return {
@@ -188,14 +488,14 @@ def _sample_json(file_path: str, max_rows: int) -> pd.DataFrame:
 
 
 def _extract_column_metadata(df: pd.DataFrame) -> list:
-    """Extract per-column metadata: stats from sample + LLM semantic inference.
+    """Extract per-column metadata: stats from sample + deterministic type inference.
 
-    LLM calls run in PARALLEL across columns using ThreadPoolExecutor.
-    Stats are computed locally from the sample (never full data).
+    NO LLM calls — uses pandas dtype, column name patterns, and value analysis.
     """
     total_rows = len(df)
+    results = []
 
-    def _process_column(col):
+    for col in df.columns:
         series = df[col]
         samples = series.dropna().astype(str).tolist()[:6]
 
@@ -205,46 +505,25 @@ def _extract_column_metadata(df: pd.DataFrame) -> list:
         unique_count = series.nunique()
         unique_ratio = round(unique_count / non_null_count, 2) if non_null_count > 0 else 0.0
 
-        # LLM semantic inference — runs in thread pool
-        llm_output = infer_column_metadata(col, samples)
+        # Deterministic inference — no LLM call
+        print(f"[FUNCTION] Entering _infer_column_type_local | column={col}")
+        inferred = _infer_column_type_local(col, series, samples)
+        print(f"[STAGE] METADATA | [FUNCTION] Inferred type={inferred.get('predicted_type')} for '{col}' (confidence={inferred.get('confidence')})")
+        print(f"[FUNCTION] Exiting _infer_column_type_local | column={col}")
 
-        return {
+        results.append({
             "name": col,
             "samples": samples,
-            "predicted_type": llm_output.get("predicted_type", "unknown"),
-            "predicted_description": llm_output.get("predicted_description", ""),
-            "confidence": llm_output.get("confidence", 0.0),
+            "predicted_type": inferred.get("predicted_type", "unknown"),
+            "predicted_description": inferred.get("predicted_description", ""),
+            "confidence": inferred.get("confidence", 0.0),
             "detected_dtype": str(series.dtype),
             "missing_ratio": missing_ratio,
             "unique_ratio": unique_ratio,
-            "semantic_info": llm_output,
-        }
+            "semantic_info": inferred,
+        })
 
-    # Parallel LLM calls — each column independently inferred
-    columns = list(df.columns)
-    with ThreadPoolExecutor(max_workers=_MAX_LLM_THREADS) as executor:
-        futures = {executor.submit(_process_column, col): col for col in columns}
-        results = {}
-        for future in as_completed(futures):
-            col_name = futures[future]
-            try:
-                results[col_name] = future.result()
-            except Exception:
-                # If one column fails, record it with defaults — don't crash pipeline
-                results[col_name] = {
-                    "name": col_name,
-                    "samples": [],
-                    "predicted_type": "unknown",
-                    "predicted_description": "Inference failed",
-                    "confidence": 0.0,
-                    "detected_dtype": str(df[col_name].dtype),
-                    "missing_ratio": 0.0,
-                    "unique_ratio": 0.0,
-                    "semantic_info": {},
-                }
-
-    # Preserve original column order
-    return [results[col] for col in columns]
+    return results
 
 
 def _detect_edge_cases(df: pd.DataFrame, columns_metadata: list, data_summary: dict) -> dict:
@@ -362,16 +641,31 @@ def _build_result_from_df(df: pd.DataFrame, source_type: str) -> dict:
         return {"columns": [], "data_summary": {}}
 
     columns_metadata = _extract_column_metadata(df)
+    issue_stack = _build_issue_stack(df, columns_metadata)
 
     column_headers = list(df.columns)
     sample_rows = df.head(5).to_dict(orient="records")
     data_types = {col: str(dtype) for col, dtype in df.dtypes.items()}
+
+    column_metadata_summary = [
+        {
+            "name": cm["name"],
+            "predicted_type": cm["predicted_type"],
+            "predicted_description": cm["predicted_description"],
+            "confidence": cm["confidence"],
+            "missing_ratio": cm["missing_ratio"],
+            "unique_ratio": cm["unique_ratio"],
+        }
+        for cm in columns_metadata
+    ]
 
     data_summary = generate_data_summary(
         column_headers=column_headers,
         sample_rows=sample_rows,
         data_types=data_types,
         source_type=source_type,
+        column_metadata=column_metadata_summary,
+        issue_stack=issue_stack,
     )
 
     return {

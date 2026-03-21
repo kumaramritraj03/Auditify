@@ -49,10 +49,14 @@ def execute_code(code: str):
 
     Internally delegates to the REPL engine.
     """
+    print("[FUNCTION] Entering execute_code")
+    print(f"[EXECUTION] Code length: {len(code)} chars")
     repl_result = execute_code_repl(code)
 
     # Map to legacy format
     if repl_result["status"] == "success":
+        print("[EXECUTION] Execution completed successfully")
+        print("[FUNCTION] Exiting execute_code")
         return {
             "result": repl_result["result"],
             "summary": "Execution successful",
@@ -60,6 +64,8 @@ def execute_code(code: str):
             "logs": "\n".join(repl_result["logs"]),
         }
     else:
+        print(f"[EXECUTION] [ERROR] Execution failed: {str(repl_result.get('error', ''))[:200]}")
+        print("[FUNCTION] Exiting execute_code")
         return {
             "result": None,
             "summary": "Execution failed",
@@ -89,22 +95,33 @@ def execute_code_repl(code: str, on_step=None, timeout=120):
           "error": str | None,
         }
     """
+    print("[FUNCTION] Entering execute_code_repl")
     clean_code = _strip_code_fences(code)
 
     # 1. Validate safety
+    print("[EXECUTION] Step 1: Validating code safety...")
     safety_error = _validate_code_safety(clean_code)
     if safety_error:
         err = f"Code safety violation: {safety_error}"
+        print(f"[EXECUTION] [ERROR] Safety violation: {safety_error}")
         if on_step:
             on_step({"step": 0, "total": 0, "label": "Safety Check",
                       "status": "error", "output": "", "error": err})
         return {"status": "error", "logs": [], "steps": [], "result": None, "error": err}
 
+    print("[EXECUTION] Safety check passed")
+
     # 2. Chunk the code
+    print("[EXECUTION] Step 2: Chunking code...")
     chunks = _chunk_code(clean_code)
     if not chunks:
         err = "No executable code found."
+        print(f"[EXECUTION] [ERROR] {err}")
         return {"status": "error", "logs": [], "steps": [], "result": None, "error": err}
+
+    print(f"[EXECUTION] Code chunked into {len(chunks)} chunks")
+    for i, c in enumerate(chunks):
+        print(f"[EXECUTION]   Chunk {i}: {c['label']}")
 
     # 3. Build the REPL driver script and manifest
     manifest_path = os.path.join(_SCRIPTS_DIR, "repl_manifest.json")
@@ -119,6 +136,7 @@ def execute_code_repl(code: str, on_step=None, timeout=120):
     _write_repl_driver(driver_path, manifest_path)
 
     # 4. Execute with real-time streaming
+    print("[EXECUTION] Step 3: Launching subprocess for REPL execution...")
     all_logs = []
     steps = []
     result_value = None
@@ -136,6 +154,7 @@ def execute_code_repl(code: str, on_step=None, timeout=120):
         )
     except Exception as e:
         err = f"Failed to start execution process: {e}"
+        print(f"[EXECUTION] [ERROR] {err}")
         return {"status": "error", "logs": [], "steps": [], "result": None, "error": err}
 
     # Read stderr in background thread to avoid deadlock
@@ -237,6 +256,11 @@ def execute_code_repl(code: str, on_step=None, timeout=120):
         error_value = "Code did not produce a 'result' variable."
 
     status = "success" if error_value is None else "error"
+
+    print(f"[EXECUTION] REPL execution finished | status={status} | steps={len(steps)} | logs={len(all_logs)}")
+    if error_value:
+        print(f"[EXECUTION] [ERROR] {str(error_value)[:200]}")
+    print("[FUNCTION] Exiting execute_code_repl")
 
     return {
         "status": status,
