@@ -695,31 +695,27 @@ OUTPUT FORMAT (STRICT JSON):
 # =========================================================
 
 DOCUMENT_PROMPT = """
-You are a Document Understanding Engine.
+You are a Document Summarizer for an audit system.
 
-You are given extracted OCR text from sampled pages.
+You are given raw text extracted from a PDF document.
+
+YOUR ONLY JOB: Describe what this document is about. Nothing else.
 
 STRICT RULES:
-1. Do NOT hallucinate fields.
-2. Only use visible text.
-3. Keep response structured.
+1. Do NOT extract data rows or tables.
+2. Do NOT compute, infer, or reconstruct any values.
+3. Do NOT return structured records or arrays.
+4. Only describe the document at a high level.
 
 INPUT:
-Extracted Text:
+Extracted PDF Text:
 {text}
 
-TASK:
-Identify:
-- document type
-- summary
-- key fields
-
-OUTPUT FORMAT:
+OUTPUT FORMAT (strict JSON, no other text):
 {{
-  "document_type": "...",
-  "summary": "...",
-  "detected_fields": ["...", "..."],
-  "confidence": 0.0
+  "document_type": "invoice | report | contract | statement | unknown",
+  "summary": "One or two sentences describing what this document is about.",
+  "key_themes": ["theme1", "theme2"]
 }}
 """
 

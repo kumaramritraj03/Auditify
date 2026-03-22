@@ -363,25 +363,24 @@ def infer_column_metadata(name, samples):
     }
 
 
-def infer_document_metadata(text):
-    """Infer metadata from unstructured document text (PDF/OCR)."""
+def infer_document_metadata(text) -> dict:
+    """Generate a high-level document summary via LLM.
+
+    This is the ONLY permitted LLM use for PDFs.
+    Returns a summary dict — never structured data rows.
+    """
     print("[FUNCTION] Entering infer_document_metadata")
     prompt = DOCUMENT_PROMPT.format(text=text)
-    print("[STAGE] METADATA | [LLM CALL] Inferring document metadata")
+    print("[STAGE] METADATA | [LLM CALL] Generating document summary")
     response = call_llm(prompt, caller="infer_document_metadata")
     result = _parse_json(response, fallback=None)
     if result and isinstance(result, dict):
         print(f"[STAGE] METADATA | [FUNCTION] Document type={result.get('document_type')}")
         print("[FUNCTION] Exiting infer_document_metadata")
         return result
-    print("[STAGE] METADATA | [FUNCTION] Could not parse document metadata, using fallback")
+    print("[STAGE] METADATA | [FUNCTION] Could not parse document summary, using fallback")
     print("[FUNCTION] Exiting infer_document_metadata")
-    return {
-        "document_type": "unknown",
-        "summary": response.strip(),
-        "detected_fields": [],
-        "confidence": 0.0
-    }
+    return {"document_type": "unknown", "summary": "", "key_themes": []}
 
 
 def map_fields(required_fields, columns):

@@ -679,16 +679,12 @@ def _build_result_from_df(df: pd.DataFrame, source_type: str) -> dict:
 # { "columns": [...], "data_summary": {...}, "source_type": ..., "edge_cases": {...} }
 
 def process_pdf_file(path: str) -> dict:
-    """Extract metadata from PDF via text extraction + LLM.
+    """Deterministic PDF ingestion.
 
-    Returns STANDARDIZED format matching structured data output:
-    {
-        "columns": [{unified column-like metadata for detected fields}],
-        "data_summary": {},
-        "source_type": "pdf",
-        "edge_cases": {is_empty, read_error, ocr_confidence, ...},
-        "document_info": {document_type, summary, detected_fields, confidence}
-    }
+    1. pdfplumber: extract real tables (bordered) → DataFrame → _build_result_from_df
+    2. pdfplumber: extract raw text (for summary + OCR confidence signal)
+    3. LLM: document summary/description ONLY — never touches data extraction
+    4. No tables found → return empty schema, do NOT fabricate structure
     """
     edge_cases = {
         "is_empty": False,
@@ -698,132 +694,113 @@ def process_pdf_file(path: str) -> dict:
     }
 
     try:
-        import fitz  # PyMuPDF
+        import pdfplumber
     except ImportError:
         edge_cases["read_error"] = True
-        return {
-            "columns": [],
-            "data_summary": {},
-            "source_type": "pdf",
-            "column_count": 0,
-            "sample_row_count": 0,
-            "edge_cases": edge_cases,
-            "document_info": {
-                "document_type": "pdf",
-                "summary": "PDF processing requires PyMuPDF. Install: pip install PyMuPDF",
-                "detected_fields": [],
-                "confidence": 0.0,
-                "error": "missing_dependency",
-            },
-        }
+        print("[PDF] pdfplumber not installed")
+        return {"columns": [], "data_summary": {}, "source_type": "pdf",
+                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
     try:
-        doc = fitz.open(path)
+        pdf = pdfplumber.open(path)
     except Exception:
         edge_cases["read_error"] = True
-        return {
-            "columns": [],
-            "data_summary": {},
-            "source_type": "pdf",
-            "column_count": 0,
-            "sample_row_count": 0,
-            "edge_cases": edge_cases,
-            "document_info": {
-                "document_type": "pdf",
-                "summary": "Failed to open PDF. File may be corrupt or password-protected.",
-                "detected_fields": [],
-                "confidence": 0.0,
-            },
-        }
+        print("[PDF] Failed to open PDF")
+        return {"columns": [], "data_summary": {}, "source_type": "pdf",
+                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
-    total_pages = len(doc)
-
-    if total_pages == 0:
-        doc.close()
+    if not pdf.pages:
+        pdf.close()
         edge_cases["is_empty"] = True
-        return {
-            "columns": [],
-            "data_summary": {},
-            "source_type": "pdf",
-            "column_count": 0,
-            "sample_row_count": 0,
-            "edge_cases": edge_cases,
-            "document_info": {
-                "document_type": "pdf",
-                "summary": "Empty PDF — no pages found.",
-                "detected_fields": [],
-                "confidence": 0.0,
-            },
-        }
+        print("[PDF] Tables detected: 0")
+        print("[PDF] OCR used: No")
+        print("[PDF] Structured rows: 0")
+        print("[PDF] Text length: 0")
+        return {"columns": [], "data_summary": {}, "source_type": "pdf",
+                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
-    # Sample 5-6 random pages per PRD
-    import random
-    if total_pages <= 6:
-        sample_pages = list(range(total_pages))
-    else:
-        sample_pages = sorted(random.sample(range(total_pages), 6))
+    # ── 1. Extract tables (deterministic) ────────────────────
+    table_dfs: list = []
+    raw_text_parts: list = []
 
-    extracted_text = ""
-    for page_num in sample_pages:
-        page = doc[page_num]
-        extracted_text += f"\n--- Page {page_num + 1} ---\n"
-        extracted_text += page.get_text()
+    for page in pdf.pages:
+        page_text = page.extract_text() or ""
+        if page_text.strip():
+            raw_text_parts.append(page_text)
 
-    doc.close()
+        for table in page.extract_tables():
+            if not table or len(table) < 2:
+                continue
+            header = [
+                re.sub(r'\s+', '_', str(h).strip().lower()) if h else f"col_{i}"
+                for i, h in enumerate(table[0])
+            ]
+            try:
+                tdf = pd.DataFrame(table[1:], columns=header)
+                tdf.dropna(how="all", inplace=True)
+                tdf = tdf[tdf.apply(lambda r: r.astype(str).str.strip().ne("").any(), axis=1)]
+                if not tdf.empty:
+                    table_dfs.append(tdf)
+            except Exception:
+                continue
 
-    if not extracted_text.strip():
+    pdf.close()
+
+    # ── 2. Raw text stats (OCR confidence signal) ─────────────
+    full_text = "\n".join(raw_text_parts).strip()
+    text_len = len(full_text)
+    ocr_used = False  # pdfplumber does not invoke OCR; scanned PDFs yield empty text
+
+    if text_len == 0:
         edge_cases["ocr_confidence"] = "low"
-        return {
-            "columns": [],
-            "data_summary": {},
-            "source_type": "pdf",
-            "column_count": 0,
-            "sample_row_count": 0,
-            "edge_cases": edge_cases,
-            "document_info": {
-                "document_type": "pdf",
-                "summary": "No text extracted. Document may be scanned/image-based. OCR required.",
-                "detected_fields": [],
-                "confidence": 0.0,
-            },
-        }
-
-    # Assess OCR confidence from text quality
-    text_len = len(extracted_text.strip())
-    if text_len < 100:
+        ocr_used = True   # likely scanned — text layer absent
+    elif text_len < 100:
         edge_cases["ocr_confidence"] = "low"
     elif text_len < 500:
         edge_cases["ocr_confidence"] = "medium"
     else:
         edge_cases["ocr_confidence"] = "high"
 
-    # Send to LLM for field detection
-    llm_result = infer_document_metadata(extracted_text[:4000])
+    table_count = len(table_dfs)
+    print(f"[PDF] Tables detected: {table_count}")
+    print(f"[PDF] OCR used: {'Yes' if ocr_used else 'No'}")
+    print(f"[PDF] Text length: {text_len}")
 
-    # Build standardized columns from detected fields
-    detected_fields = llm_result.get("detected_fields", [])
-    columns = []
-    for field in detected_fields:
-        columns.append({
-            "name": field,
-            "samples": [],
-            "predicted_type": "document_field",
-            "predicted_description": f"Field detected from PDF: {field}",
-            "confidence": llm_result.get("confidence", 0.0),
-            "detected_dtype": "text",
-            "missing_ratio": 0.0,
-            "unique_ratio": 0.0,
-            "semantic_info": {},
-        })
+    # ── 3. Build DataFrame only from real extracted tables ────
+    if not table_dfs:
+        # No real structure found — do NOT fabricate
+        print("[PDF] Structured rows: 0")
+        doc_summary = infer_document_metadata(full_text[:4000]) if full_text else {}
+        return {
+            "columns": [],
+            "data_summary": doc_summary,
+            "source_type": "pdf",
+            "column_count": 0,
+            "sample_row_count": 0,
+            "edge_cases": edge_cases,
+        }
+
+    # Merge tables: same schema → concat; mixed schemas → largest table wins
+    col_sets = [frozenset(t.columns) for t in table_dfs]
+    if len(set(col_sets)) == 1:
+        final_df = pd.concat(table_dfs, ignore_index=True)
+    else:
+        final_df = max(table_dfs, key=len)
+
+    print(f"[PDF] Structured rows: {len(final_df)}")
+
+    # ── 4. LLM: document summary only ────────────────────────
+    doc_summary = infer_document_metadata(full_text[:4000]) if full_text else {}
+
+    result = _build_result_from_df(final_df, source_type="pdf")
 
     return {
-        "columns": columns,
-        "data_summary": {},
+        "columns": result.get("columns", []),
+        "data_summary": doc_summary or result.get("data_summary", {}),
         "source_type": "pdf",
-        "column_count": len(columns),
-        "sample_row_count": 0,
+        "column_count": len(result.get("columns", [])),
+        "sample_row_count": len(final_df),
         "edge_cases": edge_cases,
-        "document_info": llm_result,
     }
 
 
