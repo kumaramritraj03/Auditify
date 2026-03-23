@@ -231,14 +231,15 @@ Your task is to convert technical data anomalies AND query ambiguities into clea
 You will receive the following inputs:
 
 1. User Query — the analytical task the auditor wants to perform.
-2. Dataset Summary — describes the dataset structure including identifiers, categorical columns, numeric metrics, temporal fields, and the dataset context profile.
-3. Issue Stack — anomalies and ambiguities detected during the automated data audit process, including:
+2. Per-File Summaries — separate summary for EACH uploaded file including its name, type, dataset profile, columns, and detected issues.
+3. Dataset Summary — combined overview of all datasets.
+4. Issue Stack — anomalies and ambiguities detected during the automated data audit process, including:
    • Candidate groups (multiple columns of the same type)
    • Semantic conflicts (ambiguous column roles)
    • Join risks
    • Header detection issues
-4. Metadata — full column-level metadata with types and samples.
-5. Available Column Names — the ONLY columns that exist in the dataset.
+5. Metadata — full column-level metadata with types and samples.
+6. Available Column Names — the ONLY columns that exist in the dataset.
 
 IMPORTANT RULES:
 • Never silently modify or remove data.
@@ -254,11 +255,23 @@ IMPORTANT RULES:
 • Do NOT generate clarifications for informational or non-blocking issues (e.g., join_risk when the query does not involve joins).
 • The number of questions must be dynamic: 0 if nothing is ambiguous, 1 if only one issue, N if N issues are relevant. NEVER pad to a fixed count.
 
+MULTI-FILE RULES (CRITICAL):
+• EVERY clarification question MUST ALWAYS start with a file reference WITHOUT EXCEPTION.
+• For single-file issues: use format "[File: filename.csv]" at the VERY BEGINNING of the question.
+• For cross-file issues: use format "[Files: file1.csv, file2.csv]" at the VERY BEGINNING of the question.
+• NEVER generate a clarification question without a file reference prefix.
+• When multiple files are uploaded, EVERY clarification question MUST reference the specific file name(s) it applies to.
+• Generate separate questions per file when ambiguities are file-specific — do NOT merge questions across files.
+• Each file's columns are independent — a column in File A is distinct from a same-named column in File B.
+
 INPUT:
 User Query:
 {query}
 
-Dataset Summary:
+Per-File Summaries (each file's metadata separately):
+{file_summaries}
+
+Dataset Summary (combined):
 {data_summary}
 
 Issue Stack (detected anomalies):
@@ -279,10 +292,11 @@ ONLY generate clarification questions for issues that DIRECTLY IMPACT the user's
 If attempt_count >= 2, return [] immediately — the system has reached its clarification limit.
 If previous questions are provided, DO NOT regenerate the same or equivalent questions.
 For each RELEVANT and BLOCKING issue, generate a clarification question that includes:
+- The file reference prefix (MANDATORY at the beginning)
 - A clear alert label (e.g., "Audit Integrity Alert", "Temporal Integrity Alert", "Column Mapping Alert")
 - What was detected (the anomaly or ambiguity)
 - The audit risk if ignored
-- Resolution options with actual column names
+- Resolution options with actual column names from that specific file
 
 Also identify query-level ambiguities such as:
 - Column mapping ambiguity (user references a concept but multiple columns match)
@@ -290,22 +304,27 @@ Also identify query-level ambiguities such as:
 - Missing required fields for the requested analysis
 - Date field confusion (multiple temporal columns)
 - Entity ambiguity (vendor/customer/etc.)
+- Cross-file join ambiguity (which columns to use for linking files)
 
 OUTPUT FORMAT (STRICT JSON):
 Return a JSON list of strings. Each string is a complete clarification question.
-Include the alert context and available column names within each question.
+EACH string MUST start with a file reference prefix as defined above.
 
-Example:
+Example (single file):
 [
-  "Temporal Integrity Alert: Multiple date columns detected (order_date, payment_date, ship_date). Using the wrong time dimension could distort trend analysis. Which column should be used as the primary date for this analysis? Available columns: [order_date, payment_date, ship_date]",
-  "Column Mapping Alert: Your query mentions 'revenue' but multiple numeric columns exist. Picking the wrong metric would misstate aggregated totals. Which column represents revenue? Available columns: [unit_price, total_amount, discount, tax_amount]"
+  "[File: transactions.csv] Temporal Integrity Alert: Multiple date columns detected (order_date, payment_date, ship_date). Using the wrong time dimension could distort trend analysis. Which column should be used as the primary date for this analysis? Available columns: [order_date, payment_date, ship_date]"
+]
+
+Example (multiple files):
+[
+  "[File: sales.csv] Column Mapping Alert: Your query mentions 'revenue' but multiple numeric columns exist in sales.csv. Which column represents revenue? Available columns: [unit_price, total_amount, discount]",
+  "[File: customers.csv] Entity Mapping Alert: Multiple name columns detected in customers.csv. Which represents the primary customer identifier? Available columns: [customer_name, company_name, contact_name]",
+  "[Files: sales.csv, customers.csv] Join Alert: To combine these files, which columns should be used as the join key? sales.csv has [customer_id, account_id]. customers.csv has [id, customer_code]."
 ]
 
 If no clarification is needed, return:
 []
 """
-
-
 # =========================================================
 # CLARIFICATION VALIDATION PROMPT
 # =========================================================
@@ -591,7 +610,7 @@ CRITICAL DuckDB API RULES (violating these will cause runtime errors):
 - NEVER assume a single file. ALWAYS use file_registry["alias"] for EVERY data access.
 - The FIRST line MUST be: file_registry = __FILE_REGISTRY__
 - For EACH alias required, validate: if "alias" not in file_registry: raise ValueError(...)
-- After loading each file, log its columns: print(f"[alias] columns: {list(df.columns)}")
+- After loading each file, log its columns: print(f"[alias] columns: {{list(df.columns)}}")
 - This ensures workflows remain replayable on any structurally compatible dataset.
 
 🚨 FINAL DETERMINISM GUARANTEE

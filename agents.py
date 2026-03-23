@@ -71,7 +71,7 @@ def classify_query(query, metadata):
 
 
 def generate_clarifications(query, metadata, data_summary=None, edge_cases=None,
-                            attempt_count=0, previous_questions=None):
+                            attempt_count=0, previous_questions=None, sources=None):
     """Generate clarification questions dynamically based on actual need.
     Uses dataset summary and detected anomalies (issue stack) for audit-aware questions.
     Questions include actual column names as options.
@@ -80,6 +80,8 @@ def generate_clarifications(query, metadata, data_summary=None, edge_cases=None,
         attempt_count: How many clarification rounds have already occurred (0-based).
                        If >= 2, returns [] immediately (max attempts reached).
         previous_questions: List of previously asked questions to avoid repetition.
+        sources: List of per-file source dicts with keys: name, type, columns, data_summary, edge_cases.
+                 When provided, clarification questions reference specific file names.
     """
     print(f"[FUNCTION] Entering generate_clarifications | attempt={attempt_count}")
     # Hard stop: max 2 clarification attempts
@@ -92,6 +94,9 @@ def generate_clarifications(query, metadata, data_summary=None, edge_cases=None,
     # Build issue stack from edge_cases and data_summary ambiguities
     issue_stack = _build_issue_stack(data_summary, edge_cases)
 
+    # Build per-file summaries for multi-file awareness
+    file_summaries = _build_file_summaries(sources) if sources else "Single file upload — no per-file breakdown."
+
     prev_q_text = json.dumps(previous_questions, indent=2) if previous_questions else "None"
 
     prompt = CLARIFICATION_PROMPT.format(
@@ -99,6 +104,7 @@ def generate_clarifications(query, metadata, data_summary=None, edge_cases=None,
         metadata=metadata,
         column_names=column_names,
         data_summary=json.dumps(data_summary, indent=2) if data_summary else "Not available",
+        file_summaries=file_summaries,
         issue_stack=json.dumps(issue_stack, indent=2) if issue_stack else "No anomalies detected",
         attempt_count=attempt_count,
         previous_questions=prev_q_text,
@@ -222,6 +228,59 @@ def _build_issue_stack(data_summary, edge_cases):
             })
 
     return issues
+
+
+def _build_file_summaries(sources):
+    """Build a structured per-file summary string for the clarification prompt.
+
+    Each file gets its own block with name, type, columns, dataset profile, and issues.
+    This enables the LLM to generate file-specific clarification questions.
+    """
+    if not sources:
+        return "No file information available."
+
+    parts = []
+    for src in sources:
+        name = src.get("name", "unknown")
+        src_type = src.get("type", "unknown")
+        cols = src.get("columns", [])
+        summary = src.get("data_summary", {})
+        edge = src.get("edge_cases", {})
+
+        col_names = [c.get("name", "") for c in cols if isinstance(c, dict)]
+        col_types = {c.get("name", ""): c.get("predicted_type", "unknown") for c in cols if isinstance(c, dict)}
+
+        block = f"--- File: {name} (type: {src_type}) ---\n"
+        block += f"Columns ({len(col_names)}): {col_names}\n"
+        block += f"Column Types: {json.dumps(col_types)}\n"
+
+        if summary:
+            profile = summary.get("dataset_context_profile", "")
+            if profile:
+                block += f"Dataset Profile: {profile}\n"
+            granularity = summary.get("granularity_hypothesis", "")
+            if granularity:
+                block += f"Granularity: {granularity}\n"
+            ambiguities = summary.get("ambiguities", [])
+            if ambiguities:
+                block += f"Ambiguities: {json.dumps(ambiguities)}\n"
+
+        if edge:
+            issues = []
+            if edge.get("is_empty"):
+                issues.append("File is empty")
+            if not edge.get("has_headers", True):
+                issues.append("Headers may be missing")
+            if edge.get("join_risk"):
+                issues.append("Join risk detected")
+            for group in edge.get("candidate_groups", []):
+                issues.append(f"Multiple {group.get('type', '')} columns: {group.get('columns', [])}")
+            if issues:
+                block += f"Issues: {'; '.join(issues)}\n"
+
+        parts.append(block)
+
+    return "\n".join(parts)
 
 
 def validate_clarification_answers(query, clarification_answers, metadata):

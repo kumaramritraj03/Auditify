@@ -172,7 +172,7 @@ with st.sidebar:
     # ── Quick access: Run saved workflow without uploading ────
     _sidebar_workflows = fetch_workflows()
     if _sidebar_workflows:
-        if st.button("Run Existing Workflow", use_container_width=True, type="primary"):
+        if st.button("Run Existing Workflow", use_container_width=True, type="primary", key="sidebar_run_workflow"):
             st.session_state.workflows = _sidebar_workflows
             st.session_state.selected_workflow = None
             st.session_state.stage = "SELECT_WORKFLOW"
@@ -218,6 +218,8 @@ with st.sidebar:
                         "source_id": file_id, "name": orig_name,
                         "type": ftype, "path": local_path,
                         "column_count": len(cols),
+                        "columns": cols,
+                        "data_summary": result.get("data_summary", {}),
                         "edge_cases": result.get("edge_cases", {}),
                     }]
                     st.session_state.uploaded = True
@@ -254,11 +256,9 @@ with st.sidebar:
                 with ThreadPoolExecutor(max_workers=min(len(saved), 4)) as executor:
                     processed = list(executor.map(_extract_one, saved))
 
-                # Step 3: Merge all metadata into session state
+                # Step 3: Store per-file metadata separately in sources
                 all_columns = []
                 all_sources = []
-                merged_summary = {}
-                merged_edge_cases = {}
                 primary_path = ""
                 primary_type = ""
                 primary_id = ""
@@ -273,6 +273,8 @@ with st.sidebar:
                         "type": item["type"],
                         "path": item["path"],
                         "column_count": len(cols),
+                        "columns": cols,
+                        "data_summary": result.get("data_summary", {}),
                         "edge_cases": result.get("edge_cases", {}),
                     })
                     # Use first structured file as primary for orchestration
@@ -280,8 +282,6 @@ with st.sidebar:
                         primary_path = item["path"]
                         primary_type = item["type"]
                         primary_id = item["id"]
-                        merged_summary = result.get("data_summary", {})
-                        merged_edge_cases = result.get("edge_cases", {})
 
                 # Fallback: if no structured file, use first file
                 if not primary_path and processed:
@@ -289,8 +289,6 @@ with st.sidebar:
                     primary_path = first["path"]
                     primary_type = first["type"]
                     primary_id = first["id"]
-                    merged_summary = first["result"].get("data_summary", {})
-                    merged_edge_cases = first["result"].get("edge_cases", {})
 
                 # Build file_registry: alias = stem of filename, de-duplicated
                 built_registry = {}
@@ -306,10 +304,12 @@ with st.sidebar:
                 if primary_path:
                     built_registry["default"] = primary_path
 
+                # Use primary source's summary/edge_cases for backward compat
+                _primary_src = next((s for s in all_sources if s["path"] == primary_path), all_sources[0])
                 print(f"[STAGE] UPLOAD | [FUNCTION] Metadata extraction complete | {len(all_columns)} columns from {len(all_sources)} sources")
                 st.session_state.metadata = all_columns
-                st.session_state.data_summary = merged_summary
-                st.session_state.edge_cases = merged_edge_cases
+                st.session_state.data_summary = _primary_src.get("data_summary", {})
+                st.session_state.edge_cases = _primary_src.get("edge_cases", {})
                 st.session_state.file_path = primary_path
                 st.session_state.file_type = primary_type
                 st.session_state.source_id = primary_id
@@ -346,99 +346,104 @@ with st.sidebar:
                             label_visibility="collapsed",
                         )
 
-        # Show multi-source summary if multiple files uploaded
+        # ── Per-File Dataset Profiles ─────────────────────────
         sources = st.session_state.sources
-        if len(sources) > 1:
-            st.subheader(f"Sources ({len(sources)})")
-            for src in sources:
-                st.caption(f"{src['name']} — {src['type']} ({src['column_count']} cols)")
 
-        st.subheader("Dataset Profile")
+        for src_idx, src in enumerate(sources):
+            src_name = src.get("name", f"File {src_idx + 1}")
+            src_type = src.get("type", "unknown")
+            src_cols = src.get("columns", [])
+            src_summary = src.get("data_summary", {})
+            src_edge = src.get("edge_cases", {})
 
-        summary = st.session_state.data_summary
-        if summary:
-            profile = summary.get("dataset_context_profile", "")
-            if profile:
-                st.markdown(f"_{profile}_")
+            st.subheader(f"Dataset Profile — {src_name}")
+            st.caption(f"Type: {src_type.upper()} | Columns: {len(src_cols)}")
 
-            granularity = summary.get("granularity_hypothesis", "")
-            if granularity:
-                st.info(f"**Granularity:** {granularity}")
+            if src_summary:
+                profile = src_summary.get("dataset_context_profile", "")
+                if profile:
+                    st.markdown(f"_{profile}_")
 
-            schema = summary.get("schema_classification", {})
-            if schema:
-                with st.expander("Schema Classification", expanded=False):
-                    for role, cols in schema.items():
-                        if cols:
-                            st.markdown(f"**{role.replace('_', ' ').title()}:** {', '.join(cols)}")
+                granularity = src_summary.get("granularity_hypothesis", "")
+                if granularity:
+                    st.info(f"**Granularity:** {granularity}")
 
-            ambiguities = summary.get("ambiguities", [])
-            if ambiguities:
-                with st.expander("Detected Ambiguities", expanded=False):
-                    for amb in ambiguities:
-                        st.warning(
-                            f"**{amb.get('type', '')}**: {amb.get('description', '')}  \n"
-                            f"Columns: `{', '.join(amb.get('columns', []))}`"
-                        )
+                schema = src_summary.get("schema_classification", {})
+                if schema:
+                    with st.expander(f"Schema Classification — {src_name}", expanded=False):
+                        for role, cols in schema.items():
+                            if cols:
+                                st.markdown(f"**{role.replace('_', ' ').title()}:** {', '.join(cols)}")
 
-            opportunities = summary.get("analytical_opportunities", [])
-            if opportunities:
-                with st.expander("Analytical Opportunities", expanded=False):
-                    for opp in opportunities:
-                        st.markdown(f"- {opp}")
+                ambiguities = src_summary.get("ambiguities", [])
+                if ambiguities:
+                    with st.expander(f"Detected Ambiguities — {src_name}", expanded=False):
+                        for amb in ambiguities:
+                            st.warning(
+                                f"**{amb.get('type', '')}**: {amb.get('description', '')}  \n"
+                                f"Columns: `{', '.join(amb.get('columns', []))}`"
+                            )
 
-        # ── Edge Case Flags ────────────────────────────────
-        edge_cases = st.session_state.edge_cases
-        if edge_cases:
-            has_issues = (
-                edge_cases.get("is_empty")
-                or edge_cases.get("read_error")
-                or not edge_cases.get("has_headers", True)
-                or edge_cases.get("candidate_groups")
-                or edge_cases.get("join_risk")
-                or edge_cases.get("semantic_conflicts")
-                or edge_cases.get("ocr_confidence") in ("low", "medium")
-            )
-            if has_issues:
-                with st.expander("Data Quality Signals", expanded=True):
-                    if edge_cases.get("is_empty"):
-                        st.error("File is empty — no data rows detected.")
-                    if edge_cases.get("read_error"):
-                        st.error("File could not be read — may be corrupt or unsupported encoding.")
-                    if not edge_cases.get("has_headers", True):
-                        st.warning("Headers may be missing — column names look auto-generated.")
-                    if edge_cases.get("ocr_confidence") in ("low", "medium"):
-                        st.warning(f"OCR confidence: **{edge_cases['ocr_confidence']}** — text extraction may be incomplete.")
-                    if edge_cases.get("join_risk"):
-                        st.warning("Multiple ID-like columns detected — joins may need disambiguation.")
-                    for group in edge_cases.get("candidate_groups", []):
-                        st.info(
-                            f"**{group['type']}**: {', '.join(group['columns'])}  \n"
-                            f"{group['description']}"
-                        )
-                    for conflict in edge_cases.get("semantic_conflicts", []):
-                        st.info(
-                            f"**{conflict['type']}**: {', '.join(conflict.get('columns', []))}  \n"
-                            f"{conflict.get('description', '')}"
-                        )
+                opportunities = src_summary.get("analytical_opportunities", [])
+                if opportunities:
+                    with st.expander(f"Analytical Opportunities — {src_name}", expanded=False):
+                        for opp in opportunities:
+                            st.markdown(f"- {opp}")
 
-        # Column metadata table
-        if st.session_state.metadata:
-            with st.expander("Column Metadata", expanded=False):
-                col_data = []
-                for col in st.session_state.metadata:
-                    col_data.append({
-                        "Column": col.get("name", ""),
-                        "Type": col.get("predicted_type", ""),
-                        "Description": col.get("predicted_description", ""),
-                        "Confidence": col.get("confidence", 0),
-                        "Missing %": col.get("missing_ratio", 0),
-                    })
-                st.dataframe(pd.DataFrame(col_data), use_container_width=True, hide_index=True)
+            # ── Edge Case Flags per file ────────────────────
+            if src_edge:
+                has_issues = (
+                    src_edge.get("is_empty")
+                    or src_edge.get("read_error")
+                    or not src_edge.get("has_headers", True)
+                    or src_edge.get("candidate_groups")
+                    or src_edge.get("join_risk")
+                    or src_edge.get("semantic_conflicts")
+                    or src_edge.get("ocr_confidence") in ("low", "medium")
+                )
+                if has_issues:
+                    with st.expander(f"Data Quality Signals — {src_name}", expanded=True):
+                        if src_edge.get("is_empty"):
+                            st.error("File is empty — no data rows detected.")
+                        if src_edge.get("read_error"):
+                            st.error("File could not be read — may be corrupt or unsupported encoding.")
+                        if not src_edge.get("has_headers", True):
+                            st.warning("Headers may be missing — column names look auto-generated.")
+                        if src_edge.get("ocr_confidence") in ("low", "medium"):
+                            st.warning(f"OCR confidence: **{src_edge['ocr_confidence']}** — text extraction may be incomplete.")
+                        if src_edge.get("join_risk"):
+                            st.warning("Multiple ID-like columns detected — joins may need disambiguation.")
+                        for group in src_edge.get("candidate_groups", []):
+                            st.info(
+                                f"**{group['type']}**: {', '.join(group['columns'])}  \n"
+                                f"{group['description']}"
+                            )
+                        for conflict in src_edge.get("semantic_conflicts", []):
+                            st.info(
+                                f"**{conflict['type']}**: {', '.join(conflict.get('columns', []))}  \n"
+                                f"{conflict.get('description', '')}"
+                            )
+
+            # Column metadata table per file
+            if src_cols:
+                with st.expander(f"Column Metadata — {src_name}", expanded=False):
+                    col_data = []
+                    for col in src_cols:
+                        col_data.append({
+                            "Column": col.get("name", ""),
+                            "Type": col.get("predicted_type", ""),
+                            "Description": col.get("predicted_description", ""),
+                            "Confidence": col.get("confidence", 0),
+                            "Missing %": col.get("missing_ratio", 0),
+                        })
+                    st.dataframe(pd.DataFrame(col_data), use_container_width=True, hide_index=True)
+
+            if src_idx < len(sources) - 1:
+                st.divider()
 
         # Workflow shortcut
         st.divider()
-        if st.button("Run Existing Workflow", use_container_width=True, type="secondary"):
+        if st.button("Run Existing Workflow", use_container_width=True, type="secondary", key="profile_run_workflow"):
             _sb_workflows = fetch_workflows()
             st.session_state.workflows = _sb_workflows
             st.session_state.selected_workflow = None
@@ -580,7 +585,7 @@ if st.session_state.stage == "QUERY":
             add_message("system", "What would you like to analyze? Type your query below.")
             st.rerun()
     with col2:
-        if st.button("Run Existing Workflow", use_container_width=True):
+        if st.button("Run Existing Workflow", use_container_width=True, key="chat_run_workflow"):
             st.session_state.workflow_mode = True
             st.session_state.workflows = fetch_workflows()
             st.session_state.stage = "SELECT_WORKFLOW"
@@ -607,6 +612,7 @@ elif st.session_state.stage == "NEW_QUERY":
             "file_registry": st.session_state.get("file_registry", {}),
             "data_summary": st.session_state.get("data_summary", {}),
             "edge_cases": st.session_state.get("edge_cases", {}),
+            "sources": st.session_state.get("sources", []),
             "conversation_history": [],
             "clarifications": {},
             "plan": "",
@@ -903,7 +909,7 @@ elif st.session_state.stage == "EXECUTING":
     # Small delay so user can see the live UI, then offer navigation
     import time as _time
     _time.sleep(1)
-    if st.button("Continue", type="primary", use_container_width=True):
+    if st.button("Continue", type="primary", use_container_width=True, key="continue_after_exec"):
         st.rerun()
 
 
@@ -1134,7 +1140,7 @@ elif st.session_state.stage == "WORKFLOW_FILE_SELECT":
             + ", ".join(f"`{d}`" for d in deps)
             + ". Upload them using the expander above."
         )
-        if st.button("Back", use_container_width=True):
+        if st.button("Back", use_container_width=True, key="back_no_files"):
             st.session_state.stage = "SELECT_WORKFLOW"
             st.rerun()
         st.stop()
@@ -1186,7 +1192,7 @@ elif st.session_state.stage == "WORKFLOW_FILE_SELECT":
             st.session_state["_wf_force_manual"] = True
             st.rerun()
 
-        if st.button("Back", use_container_width=True):
+        if st.button("Back", use_container_width=True, key="back_auto_mapped"):
             st.session_state.stage = "SELECT_WORKFLOW"
             st.rerun()
         st.stop()
@@ -1364,7 +1370,7 @@ elif st.session_state.stage == "WORKFLOW_FILE_SELECT":
     st.divider()
     col_back, col_proceed = st.columns([1, 2])
     with col_back:
-        if st.button("Back", use_container_width=True):
+        if st.button("Back", use_container_width=True, key="back_manual_map"):
             st.session_state.stage = "SELECT_WORKFLOW"
             st.rerun()
     with col_proceed:
@@ -1661,7 +1667,7 @@ elif st.session_state.stage == "WORKFLOW_EXECUTE":
 
     import time as _time
     _time.sleep(1)
-    if st.button("Continue", type="primary", use_container_width=True):
+    if st.button("Continue", type="primary", use_container_width=True, key="continue_after_wf_exec"):
         st.rerun()
 
 

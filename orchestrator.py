@@ -412,6 +412,7 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
     code = context.get("code", "")
     data_summary = context.get("data_summary", {})
     edge_cases = context.get("edge_cases", {})
+    sources = context.get("sources", [])
     column_names = _extract_column_names(metadata)
     attempt_count = context.get("clarification_attempt_count", 0)
 
@@ -434,7 +435,7 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
             }
         questions = generate_clarifications(
             user_query, metadata, data_summary, edge_cases,
-            attempt_count=0, previous_questions=[],
+            attempt_count=0, previous_questions=[], sources=sources,
         )
         if not questions or questions == []:
             return {
@@ -457,6 +458,7 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
         questions = generate_clarifications(
             user_query, metadata, data_summary, edge_cases,
             attempt_count=attempt_count, previous_questions=previous_questions,
+            sources=sources,
         )
         if not questions:
             return {
