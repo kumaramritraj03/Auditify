@@ -714,17 +714,18 @@ OUTPUT FORMAT (STRICT JSON):
 # =========================================================
 
 DOCUMENT_PROMPT = """
-You are a Document Summarizer for an audit system.
+You are a Document Metadata Analyzer for an audit system.
 
 You are given raw text extracted from a PDF document.
 
-YOUR ONLY JOB: Describe what this document is about. Nothing else.
+YOUR JOB: Analyze the document and return structured metadata following the exact format below.
 
 STRICT RULES:
 1. Do NOT extract data rows or tables.
 2. Do NOT compute, infer, or reconstruct any values.
-3. Do NOT return structured records or arrays.
-4. Only describe the document at a high level.
+3. Return ONLY valid JSON matching the schema below.
+4. detected_fields must list key fields you can identify from the document content.
+5. confidence must be a decimal between 0 and 1 reflecting how confident you are in the document_type classification.
 
 INPUT:
 Extracted PDF Text:
@@ -732,9 +733,18 @@ Extracted PDF Text:
 
 OUTPUT FORMAT (strict JSON, no other text):
 {{
-  "document_type": "invoice | report | contract | statement | unknown",
-  "summary": "One or two sentences describing what this document is about.",
-  "key_themes": ["theme1", "theme2"]
+  "document_type": "invoice | receipt | expense_report | bill | purchase_order | contract | report | statement | unknown",
+  "summary": "Concise description of what this document contains.",
+  "detected_fields": ["field1", "field2", "field3"],
+  "confidence": 0.85
+}}
+
+Example:
+{{
+  "document_type": "invoice",
+  "summary": "Vendor invoices with amounts and dates",
+  "detected_fields": ["invoice_number", "bill_amount", "invoice_date", "vendor_name"],
+  "confidence": 0.85
 }}
 """
 

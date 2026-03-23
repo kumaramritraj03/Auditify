@@ -5,7 +5,9 @@ import os
 import re
 from agents import infer_document_metadata, generate_data_summary
 
-
+import fitz  # PyMuPDF
+from vertexai.generative_models import Part
+from agents import infer_document_metadata, generate_data_summary, infer_document_metadata_vision
 # ── Supported structured extensions ────────────────────────
 _STRUCTURED_EXTENSIONS = {
     ".csv": "csv",
@@ -678,14 +680,53 @@ def _build_result_from_df(df: pd.DataFrame, source_type: str) -> dict:
 # Standardized to return the same top-level schema as structured data:
 # { "columns": [...], "data_summary": {...}, "source_type": ..., "edge_cases": {...} }
 
-def process_pdf_file(path: str) -> dict:
-    """Deterministic PDF ingestion.
+def _get_pdf_sample_images(pdf_path: str, max_pages: int = 5) -> list:
+    """Extract sample pages from PDF as Gemini Image Parts.
 
-    1. pdfplumber: extract real tables (bordered) → DataFrame → _build_result_from_df
-    2. pdfplumber: extract raw text (for summary + OCR confidence signal)
-    3. LLM: document summary/description ONLY — never touches data extraction
-    4. No tables found → return empty schema, do NOT fabricate structure
+    Samples 5-6 random pages (deterministic via file hash seed for reproducibility).
     """
+    try:
+        import random
+        import hashlib
+
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        if total_pages == 0:
+            return []
+
+        # Create deterministic seed from PDF file hash for reproducibility
+        # Same PDF always gets same random sample
+        with open(pdf_path, 'rb') as f:
+            pdf_hash = hashlib.md5(f.read()).hexdigest()
+            seed = int(pdf_hash, 16) % (2**31)
+
+        random.seed(seed)
+
+        # Randomly sample 5-6 pages from the PDF
+        num_samples = min(max_pages, total_pages)
+        sample_pages = sorted(random.sample(range(total_pages), num_samples))
+
+        parts = []
+        for idx in sample_pages:
+            page = doc.load_page(idx)
+            # Render to png, dpi 140
+            zoom = 140 / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            png_bytes = pix.tobytes("png")
+
+            # Convert to Vertex AI Part object
+            parts.append(Part.from_data(data=png_bytes, mime_type="image/png"))
+
+        doc.close()
+        return parts
+    except Exception as e:
+        print(f"[PDF VISION] Error rendering PDF: {e}")
+        return []
+
+
+def process_pdf_file(path: str) -> dict:
+    """Hybrid PDF ingestion: Table Extraction + Vision Understanding."""
     edge_cases = {
         "is_empty": False,
         "read_error": False,
@@ -697,112 +738,61 @@ def process_pdf_file(path: str) -> dict:
         import pdfplumber
     except ImportError:
         edge_cases["read_error"] = True
-        print("[PDF] pdfplumber not installed")
         return {"columns": [], "data_summary": {}, "source_type": "pdf",
                 "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
+    # ── 1. Extract tables deterministically (for execution safety) ──
+    table_dfs = []
     try:
-        pdf = pdfplumber.open(path)
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                for table in page.extract_tables():
+                    if not table or len(table) < 2:
+                        continue
+                    header = [re.sub(r'\s+', '_', str(h).strip().lower()) if h else f"col_{i}" for i, h in enumerate(table[0])]
+                    try:
+                        tdf = pd.DataFrame(table[1:], columns=header)
+                        tdf.dropna(how="all", inplace=True)
+                        tdf = tdf[tdf.apply(lambda r: r.astype(str).str.strip().ne("").any(), axis=1)]
+                        if not tdf.empty:
+                            table_dfs.append(tdf)
+                    except Exception:
+                        continue
     except Exception:
         edge_cases["read_error"] = True
-        print("[PDF] Failed to open PDF")
-        return {"columns": [], "data_summary": {}, "source_type": "pdf",
-                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
-    if not pdf.pages:
-        pdf.close()
+    final_df = pd.DataFrame()
+    if table_dfs:
+        col_sets = [frozenset(t.columns) for t in table_dfs]
+        if len(set(col_sets)) == 1:
+            final_df = pd.concat(table_dfs, ignore_index=True)
+        else:
+            final_df = max(table_dfs, key=len)
+
+    # ── 2. Vision LLM Understanding ──
+    print("[PDF] Generating document summary via Vision...")
+    image_parts = _get_pdf_sample_images(path)
+
+    doc_summary = {}
+    if image_parts:
+        doc_summary = infer_document_metadata_vision(image_parts)
+        edge_cases["ocr_confidence"] = "high" # Vision models don't rely on OCR text layers
+    else:
         edge_cases["is_empty"] = True
-        print("[PDF] Tables detected: 0")
-        print("[PDF] OCR used: No")
-        print("[PDF] Structured rows: 0")
-        print("[PDF] Text length: 0")
-        return {"columns": [], "data_summary": {}, "source_type": "pdf",
-                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
-    # ── 1. Extract tables (deterministic) ────────────────────
-    table_dfs: list = []
-    raw_text_parts: list = []
-
-    for page in pdf.pages:
-        page_text = page.extract_text() or ""
-        if page_text.strip():
-            raw_text_parts.append(page_text)
-
-        for table in page.extract_tables():
-            if not table or len(table) < 2:
-                continue
-            header = [
-                re.sub(r'\s+', '_', str(h).strip().lower()) if h else f"col_{i}"
-                for i, h in enumerate(table[0])
-            ]
-            try:
-                tdf = pd.DataFrame(table[1:], columns=header)
-                tdf.dropna(how="all", inplace=True)
-                tdf = tdf[tdf.apply(lambda r: r.astype(str).str.strip().ne("").any(), axis=1)]
-                if not tdf.empty:
-                    table_dfs.append(tdf)
-            except Exception:
-                continue
-
-    pdf.close()
-
-    # ── 2. Raw text stats (OCR confidence signal) ─────────────
-    full_text = "\n".join(raw_text_parts).strip()
-    text_len = len(full_text)
-    ocr_used = False  # pdfplumber does not invoke OCR; scanned PDFs yield empty text
-
-    if text_len == 0:
-        edge_cases["ocr_confidence"] = "low"
-        ocr_used = True   # likely scanned — text layer absent
-    elif text_len < 100:
-        edge_cases["ocr_confidence"] = "low"
-    elif text_len < 500:
-        edge_cases["ocr_confidence"] = "medium"
-    else:
-        edge_cases["ocr_confidence"] = "high"
-
-    table_count = len(table_dfs)
-    print(f"[PDF] Tables detected: {table_count}")
-    print(f"[PDF] OCR used: {'Yes' if ocr_used else 'No'}")
-    print(f"[PDF] Text length: {text_len}")
-
-    # ── 3. Build DataFrame only from real extracted tables ────
-    if not table_dfs:
-        # No real structure found — do NOT fabricate
-        print("[PDF] Structured rows: 0")
-        doc_summary = infer_document_metadata(full_text[:4000]) if full_text else {}
-        return {
-            "columns": [],
-            "data_summary": doc_summary,
-            "source_type": "pdf",
-            "column_count": 0,
-            "sample_row_count": 0,
-            "edge_cases": edge_cases,
-        }
-
-    # Merge tables: same schema → concat; mixed schemas → largest table wins
-    col_sets = [frozenset(t.columns) for t in table_dfs]
-    if len(set(col_sets)) == 1:
-        final_df = pd.concat(table_dfs, ignore_index=True)
-    else:
-        final_df = max(table_dfs, key=len)
-
-    print(f"[PDF] Structured rows: {len(final_df)}")
-
-    # ── 4. LLM: document summary only ────────────────────────
-    doc_summary = infer_document_metadata(full_text[:4000]) if full_text else {}
-
-    result = _build_result_from_df(final_df, source_type="pdf")
+    # ── 3. Return document metadata as primary output ──
+    # Vision-based document classification is the primary output for PDFs
+    # Table extraction is only used for column metadata if needed
+    result = _build_result_from_df(final_df, source_type="pdf") if not final_df.empty else {}
 
     return {
         "columns": result.get("columns", []),
-        "data_summary": doc_summary or result.get("data_summary", {}),
+        "data_summary": doc_summary,  # ✅ Always use vision metadata for PDFs (primary output)
         "source_type": "pdf",
         "column_count": len(result.get("columns", [])),
-        "sample_row_count": len(final_df),
+        "sample_row_count": len(final_df) if not final_df.empty else 0,
         "edge_cases": edge_cases,
     }
-
 
 def process_sql_source(connection_config: dict) -> dict:
     """Fetch metadata from a SQL database connection.

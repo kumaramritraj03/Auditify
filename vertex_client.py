@@ -42,3 +42,19 @@ def call_llm(prompt: str, caller: str = "unknown") -> str:
     except Exception as e:
         print(f"[LLM CALL] [ERROR] {e} | caller={caller}")
         return ""
+    
+
+def call_multimodal_llm(contents: list, caller: str = "unknown") -> str:
+    """New multimodal LLM call supporting text and images."""
+    print(f"[LLM CALL] Calling multimodal model | caller={caller} | parts={len(contents)}")
+    try:
+        response = model.generate_content(
+            contents, 
+            safety_settings=SAFETY_SETTINGS
+        )
+        if response.candidates and response.candidates[0].content.parts:
+            return response.candidates[0].content.parts[0].text
+        return ""
+    except Exception as e:
+        print(f"[LLM CALL] [ERROR] {e} | caller={caller}")
+        return ""

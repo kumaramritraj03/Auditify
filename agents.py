@@ -18,7 +18,7 @@ from prompts import (
     DATA_SUMMARY_PROMPT,
 )
 
-
+from vertex_client import call_llm, call_multimodal_llm
 def _parse_json(response: str, fallback=None):
     """Safely parse JSON from LLM response, handling markdown wrappers."""
     text = response.strip()
@@ -423,23 +423,26 @@ def infer_column_metadata(name, samples):
 
 
 def infer_document_metadata(text) -> dict:
-    """Generate a high-level document summary via LLM.
+    """Generate document metadata via LLM with detected fields and confidence.
 
     This is the ONLY permitted LLM use for PDFs.
-    Returns a summary dict — never structured data rows.
+    Returns metadata dict with document_type, summary, detected_fields, and confidence.
     """
     print("[FUNCTION] Entering infer_document_metadata")
     prompt = DOCUMENT_PROMPT.format(text=text)
-    print("[STAGE] METADATA | [LLM CALL] Generating document summary")
+    print("[STAGE] METADATA | [LLM CALL] Generating document metadata")
     response = call_llm(prompt, caller="infer_document_metadata")
     result = _parse_json(response, fallback=None)
     if result and isinstance(result, dict):
-        print(f"[STAGE] METADATA | [FUNCTION] Document type={result.get('document_type')}")
+        doc_type = result.get('document_type', 'unknown')
+        detected_fields = result.get('detected_fields', [])
+        confidence = result.get('confidence', 0.5)
+        print(f"[STAGE] METADATA | [FUNCTION] Document type={doc_type}, detected_fields={len(detected_fields)}, confidence={confidence}")
         print("[FUNCTION] Exiting infer_document_metadata")
         return result
-    print("[STAGE] METADATA | [FUNCTION] Could not parse document summary, using fallback")
+    print("[STAGE] METADATA | [FUNCTION] Could not parse document metadata, using fallback")
     print("[FUNCTION] Exiting infer_document_metadata")
-    return {"document_type": "unknown", "summary": "", "key_themes": []}
+    return {"document_type": "unknown", "summary": "", "detected_fields": [], "confidence": 0.0}
 
 
 def map_fields(required_fields, columns):
@@ -712,3 +715,66 @@ def infer_file_roles(
     print(f"[DETERMINISTIC] Final: assigned={list(role_assignments.keys())} ambiguous={ambiguous_roles} missing={missing_roles} overall_conf={overall:.3f} needs_ui={needs_ui}")
     print("[FUNCTION] Exiting infer_file_roles")
     return result
+def infer_document_metadata_vision(image_parts: list) -> dict:
+    """Uses Gemini Vision to analyze sampled pages and return document metadata."""
+    prompt = """
+    You are analyzing sampled pages from a larger PDF document for an audit system.
+    Your task: Identify what type of document this is and extract key field names visible on the pages.
+
+    TASK:
+    1. Classify the document type (invoice, receipt, expense report, bill, purchase order, contract, report, statement, etc.)
+    2. Identify all key fields/columns you can see (e.g., invoice_number, amount, date, vendor_name, etc.)
+    3. Rate your confidence in the classification (0.0 to 1.0, where 1.0 is certain)
+    4. Provide a brief summary of what the document contains
+
+    FIELD DETECTION RULES:
+    - Look for headers, labels, and column names in tables
+    - Extract visible field names exactly as shown (e.g., "Invoice #", "Bill Amount", "Date")
+    - Convert field names to snake_case format
+    - Include at least 3-5 key fields if visible
+
+    Return ONLY valid JSON matching this exact schema:
+    {
+        "document_type": "string (the document classification)",
+        "summary": "string (1-2 sentences describing document content)",
+        "detected_fields": ["field1", "field2", "field3"],
+        "confidence": 0.85
+    }
+
+    IMPORTANT: Return ONLY JSON, no other text. Do NOT wrap in markdown code blocks.
+    """
+
+    # Combine the prompt string and the image Part objects
+    contents = [prompt] + image_parts
+    response_text = call_multimodal_llm(contents, caller="infer_document_metadata_vision")
+
+    # Try to extract JSON from markdown code blocks first
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", response_text, re.DOTALL)
+    if match:
+        response_text = match.group(1)
+
+    # Then try to find JSON object directly in response
+    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+    if json_match:
+        response_text = json_match.group(0)
+
+    try:
+        result = json.loads(response_text)
+        # Ensure all required fields are present and properly typed
+        document_type = str(result.get("document_type", "unknown")).strip().lower()
+        summary = str(result.get("summary", "")).strip()
+        detected_fields = result.get("detected_fields", [])
+        if not isinstance(detected_fields, list):
+            detected_fields = [detected_fields] if detected_fields else []
+        confidence = float(result.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+
+        return {
+            "document_type": document_type,
+            "summary": summary,
+            "detected_fields": [str(f).strip() for f in detected_fields if f],
+            "confidence": confidence
+        }
+    except Exception as e:
+        print(f"[AGENT] Failed to parse vision JSON: {e} | response: {response_text[:200]}")
+        return {"document_type": "unknown", "summary": "", "detected_fields": [], "confidence": 0.0}

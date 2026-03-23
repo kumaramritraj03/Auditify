@@ -360,6 +360,7 @@ with st.sidebar:
             st.caption(f"Type: {src_type.upper()} | Columns: {len(src_cols)}")
 
             if src_summary:
+                # --- Legacy Structured Summaries (CSV/SQL) ---
                 profile = src_summary.get("dataset_context_profile", "")
                 if profile:
                     st.markdown(f"_{profile}_")
@@ -375,6 +376,47 @@ with st.sidebar:
                             if cols:
                                 st.markdown(f"**{role.replace('_', ' ').title()}:** {', '.join(cols)}")
 
+                # --- PDF Document Metadata ---
+                doc_type = src_summary.get("document_type", "")
+                if doc_type:
+                    # Display confidence as a colored badge
+                    confidence = src_summary.get("confidence", 0.0)
+                    conf_color = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.6 else "🔴"
+                    st.info(f"**Document Type:** {doc_type.title()} {conf_color} _(confidence: {confidence:.0%})_")
+
+                summary_text = src_summary.get("summary", "")
+                if summary_text:
+                    st.markdown(f"**Summary:** {summary_text}")
+
+                detected_fields = src_summary.get("detected_fields", [])
+                if detected_fields:
+                    st.markdown(f"**Detected Fields:**")
+                    field_cols = st.columns(min(3, len(detected_fields)))
+                    for idx, field in enumerate(detected_fields):
+                        with field_cols[idx % 3]:
+                            st.write(f"• {field}")
+
+                # Legacy: Topics and entities (if present)
+                topics = src_summary.get("primary_topics", [])
+                if topics:
+                    st.markdown(f"**Primary Topics:** {', '.join(topics)}")
+
+                entities = src_summary.get("important_entities_or_fields", [])
+                if entities:
+                    with st.expander(f"Key Entities & Fields — {src_name}", expanded=False):
+                        for ent in entities:
+                            st.markdown(f"- {ent}")
+
+                # Badges for visual elements detected by Gemini Vision
+                if any(k in src_summary for k in ["contains_tables", "contains_charts", "contains_images_or_diagrams", "contains_forms"]):
+                    st.markdown("**Visually Detected Elements:**")
+                    cols = st.columns(4)
+                    if src_summary.get("contains_tables"): cols[0].success("📊 Tables")
+                    if src_summary.get("contains_charts"): cols[1].success("📈 Charts")
+                    if src_summary.get("contains_images_or_diagrams"): cols[2].success("🖼️ Images")
+                    if src_summary.get("contains_forms"): cols[3].success("📝 Forms")
+
+                # --- Legacy Structured Ambiguities ---
                 ambiguities = src_summary.get("ambiguities", [])
                 if ambiguities:
                     with st.expander(f"Detected Ambiguities — {src_name}", expanded=False):

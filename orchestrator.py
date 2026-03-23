@@ -331,8 +331,9 @@ def _check_preconditions(next_tool: str, context: dict) -> str | None:
     Returns error string if precondition fails, None if OK.
     """
     if next_tool == "generate_plan":
-        if not context.get("metadata"):
-            return "Cannot generate plan: metadata is missing"
+        # FIX: Allow planning if EITHER tabular metadata OR an unstructured vision summary exists
+        if not context.get("metadata") and not context.get("data_summary"):
+            return "Cannot generate plan: neither metadata nor data_summary is available"
 
     elif next_tool == "generate_code":
         if not context.get("plan"):
@@ -349,7 +350,6 @@ def _check_preconditions(next_tool: str, context: dict) -> str | None:
             return "Cannot execute workflow: workflow code is missing"
 
     return None
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DETERMINISTIC FALLBACK (only when LLM fails or is rejected)
