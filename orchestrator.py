@@ -53,12 +53,15 @@ _ALLOWED_TRANSITIONS = {
     "NEEDS_CLARIFICATION":      {"generate_clarifications"},
     "AWAITING_PLAN":            {"generate_plan", "validate_clarifications"},
     "PLAN_CONFIRMED":           {"generate_code"},
+    "CODE_GENERATED":           {"execute_code"},
     "READY_TO_EXECUTE":         {"execute_code"},
+    "EXECUTION_ERROR":          {"generate_code", "done"},
     "SAVE_WORKFLOW":            {"extract_workflow_semantics"},
     "WORKFLOW_SELECTED":        {"map_fields"},
     "WORKFLOW_EXECUTE":         {"execute_workflow"},
     "COMPLETED":                {"done"},
     "INFORMATIONAL":            {"informational"},
+    "CLARIFICATION_INVALID":    {"generate_clarifications", "validate_clarifications"},
     "CLARIFICATION_FAILED":     {"stop"},
 }
 
@@ -370,12 +373,15 @@ def _deterministic_fallback(context: dict) -> str:
         "NEEDS_CLARIFICATION":      "generate_clarifications",
         "AWAITING_PLAN":            "generate_plan",
         "PLAN_CONFIRMED":           "generate_code",
+        "CODE_GENERATED":           "execute_code",
         "READY_TO_EXECUTE":         "execute_code",
+        "EXECUTION_ERROR":          "done",
         "SAVE_WORKFLOW":            "extract_workflow_semantics",
         "WORKFLOW_SELECTED":        "map_fields",
         "WORKFLOW_EXECUTE":         "execute_workflow",
         "COMPLETED":                "done",
         "INFORMATIONAL":            "informational",
+        "CLARIFICATION_INVALID":    "generate_clarifications",
         "CLARIFICATION_FAILED":     "stop",
     }
 
@@ -517,7 +523,9 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
     if next_tool == "execute_code":
         print("[EXECUTION] Executing tool: execute_code")
         print("[EXECUTION] Running generated code...")
-        result = execute_code(code)
+        # Inject file_registry into generated code (mirrors Streamlit's injection logic)
+        exec_code = _inject_file_registry(code, file_registry)
+        result = execute_code(exec_code)
         if result.get("error"):
             return {
                 "stage": "EXECUTION_ERROR",
@@ -582,6 +590,8 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
             if isinstance(actual_column, str):
                 remapped_code = remapped_code.replace(semantic_field, actual_column)
 
+        # Inject file_registry before execution
+        remapped_code = _inject_file_registry(remapped_code, file_registry)
         result = execute_code(remapped_code)
         if result.get("error"):
             return {
@@ -607,7 +617,7 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
     if next_tool == "informational":
         return {
             "stage": "INFORMATIONAL",
-            "data": _answer_informational(user_query, metadata),
+            "data": _answer_informational(user_query, metadata, data_summary),
             "message": "Here is the information you requested."
         }
 
@@ -722,6 +732,43 @@ def _handle_clarification_validation(_context, clarifications, column_names,
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _inject_file_registry(code: str, file_registry: dict) -> str:
+    """Inject the runtime file_registry dict into generated code.
+
+    Handles all code patterns: __FILE_REGISTRY__ sentinel, existing
+    file_registry assignment, legacy file_path assignment, or bare code.
+    """
+    import re as _re
+
+    if not file_registry:
+        return code
+
+    reg_literal = json.dumps(file_registry)
+
+    if "__FILE_REGISTRY__" in code:
+        return code.replace("__FILE_REGISTRY__", reg_literal)
+
+    if _re.search(r'^file_registry\s*=', code, flags=_re.MULTILINE):
+        return _re.sub(
+            r'^file_registry\s*=\s*.*$',
+            f"file_registry = {reg_literal}",
+            code,
+            flags=_re.MULTILINE,
+        )
+
+    if _re.search(r'^file_path\s*=', code, flags=_re.MULTILINE):
+        primary = file_registry.get("default", next(iter(file_registry.values()), ""))
+        code = _re.sub(
+            r'^file_path\s*=\s*.*$',
+            f'file_path = r"{primary}"',
+            code,
+            flags=_re.MULTILINE,
+        )
+        return f"file_registry = {reg_literal}\n" + code
+
+    return f"file_registry = {reg_literal}\n" + code
 
 
 def _answer_informational(query, metadata, data_summary=None):

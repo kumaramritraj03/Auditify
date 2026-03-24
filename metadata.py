@@ -3,8 +3,7 @@ import io
 import json
 import os
 import re
-from agents import infer_document_metadata, generate_data_summary
-from concurrent.futures import ThreadPoolExecutor  # <--- NEW IMPORT
+from concurrent.futures import ThreadPoolExecutor
 import fitz  # PyMuPDF
 from vertexai.generative_models import Part
 from agents import infer_document_metadata, generate_data_summary, infer_document_metadata_vision
@@ -724,11 +723,6 @@ def _get_pdf_sample_images(pdf_path: str, max_pages: int = 5) -> list:
         print(f"[PDF VISION] Error rendering PDF: {e}")
         return []
 
-
-from concurrent.futures import ThreadPoolExecutor
-import os
-import re
-import pandas as pd
 
 def _extract_tables_task(path: str) -> list:
     """Worker task: Extracts tables using pdfplumber."""

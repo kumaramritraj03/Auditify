@@ -2,7 +2,7 @@ import json
 import re
 import os
 from difflib import SequenceMatcher
-from vertex_client import call_llm
+from vertex_client import call_llm, call_multimodal_llm
 from prompts import (
     CLARIFICATION_PROMPT,
     CLARIFICATION_VALIDATION_PROMPT,
@@ -18,8 +18,6 @@ from prompts import (
     DATA_SUMMARY_PROMPT,
     RESULT_SUMMARY_PROMPT,
 )
-
-from vertex_client import call_llm, call_multimodal_llm
 def _parse_json(response: str, fallback=None):
     """Safely parse JSON from LLM response, handling markdown wrappers."""
     text = response.strip()

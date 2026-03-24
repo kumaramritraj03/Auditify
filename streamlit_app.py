@@ -703,6 +703,7 @@ elif st.session_state.stage == "NEW_QUERY":
             "result": None,
             "clarification_attempt_count": 0,
             "previous_clarification_questions": [],
+            "has_invalid_responses": False,
         }
 
         # Call orchestrator
@@ -797,8 +798,9 @@ elif st.session_state.stage == "CLARIFICATION":
                 st.session_state.context["_clarification_questions"] = list(
                     data.get("original_answers", {}).keys()
                 )
-                # Increment attempt count for next round
+                # Increment attempt count for next round and flag invalid responses
                 st.session_state.context["clarification_attempt_count"] = attempt + 1
+                st.session_state.context["has_invalid_responses"] = True
                 st.session_state.stage = "CLARIFICATION"
 
             elif stage == "PLANNING":
