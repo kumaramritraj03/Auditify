@@ -33,6 +33,191 @@ from agents import (
 from execution import execute_code
 from vertex_client import call_llm
 from prompts import ORCHESTRATOR_PROMPT
+"""
+Auditify — Agentic Orchestrator (Phase 2)
+Handles the routing between Fast-Path memory retrieval and deep LLM code generation.
+"""
+
+"""
+Auditify — Agentic Orchestrator (Phase 3: Autonomous ReAct Loop)
+The LLM can now write code, execute it, read the errors, and auto-correct itself.
+"""
+
+import json
+import logging
+from prompts import AGENTIC_SYSTEM_PROMPT
+from vertex_client import call_llm
+from execution import execute_code_repl
+
+logger = logging.getLogger("auditify.orchestrator")
+
+def handle_agentic_turn(query, context):
+    file_registry = context.get('file_registry', {})
+
+    # ── 1. THE FAST-PATH (Self-Awareness) ────────────────────────
+    query_lower = query.lower()
+    schema_keywords = ["column", "field", "schema", "structure", "metadata", "what is in", "show me"]
+    
+    if any(word in query_lower for word in schema_keywords) and "calculate" not in query_lower and "group" not in query_lower:
+        metadata = context.get("metadata", [])
+        if metadata:
+            total_cols = len(metadata)
+            lines = [f"I found **{total_cols} columns** in your active context. Here is the schema breakdown:\n"]
+            for col in metadata:
+                name = col.get("name", "Unknown")
+                semantic = col.get("semantic_info", {})
+                col_type = semantic.get("predicted_type", col.get("predicted_type", "unknown"))
+                desc = semantic.get("predicted_description", col.get("predicted_description", ""))
+                lines.append(f"- **`{name}`** ({col_type.title()}): {desc}")
+
+            return {
+                "thought": f"> Intercepted schema request for query: '{query}'\n> Bypassing code execution.\n> Formatting metadata directly from memory.",
+                "action": "ask_user",
+                "payload": "\n".join(lines),
+                "final_code": None,
+                "final_data": None
+            }
+
+    # ── 2. THE ReAct LOOP (Deep Analysis & Execution) ────────────────────────
+    lean_schema = [{"name": c.get("name"), "type": c.get("predicted_type")} for c in context.get('metadata', [])]
+
+    # Initialize the memory for this specific task
+    task_memory = f"""
+    {AGENTIC_SYSTEM_PROMPT}
+    
+    --- MEMORY ---
+    File Registry: {json.dumps(file_registry)}
+    Active Schema: {json.dumps(lean_schema)}
+    
+    --- USER QUERY ---
+    {query}
+    """
+
+    max_iterations = 3  # Prevent infinite loops
+    aggregated_thoughts = []
+    final_code = None
+    final_data = None
+
+    for attempt in range(max_iterations):
+        try:
+            # 1. Ask the LLM what to do
+            raw_response = call_llm(task_memory)
+            clean_response = raw_response.replace("```json", "").replace("```", "").strip()
+            parsed_json = json.loads(clean_response)
+            
+            action = parsed_json.get("action", "ask_user")
+            payload = parsed_json.get("payload", "")
+            thought = parsed_json.get("thought", f"> Attempt {attempt + 1}...")
+            aggregated_thoughts.append(thought)
+
+            # 2. If the LLM just wants to talk, break the loop and return!
+            if action == "ask_user":
+                return {
+                    "thought": "\n".join(aggregated_thoughts),
+                    "action": "ask_user",
+                    "payload": payload,
+                    "final_code": final_code,
+                    "final_data": final_data
+                }
+
+            # 3. If the LLM wants to execute code, run it!
+            elif action == "execute_code":
+                final_code = payload
+                aggregated_thoughts.append("> Injecting file paths and executing code...")
+                
+                # Inject real file paths into the code
+                code_to_run = payload
+                if file_registry:
+                    reg_lit = json.dumps(file_registry)
+                    if "__FILE_REGISTRY__" in code_to_run:
+                        code_to_run = code_to_run.replace("__FILE_REGISTRY__", reg_lit)
+                    else:
+                        code_to_run = f"file_registry = {reg_lit}\n" + code_to_run
+
+                # Execute in the sandbox
+                repl_result = execute_code_repl(code_to_run)
+
+                # 4. Check the results
+                if repl_result["status"] == "success":
+                    aggregated_thoughts.append("> Execution successful. Summarizing results...")
+                    final_data = repl_result["result"]
+                    
+                    # Feed the success back to the LLM so it can formulate a conversational answer
+                    task_memory += f"\n\n--- OBSERVATION (Code Succeeded) ---\nOutput:\n{str(final_data)[:2000]}\n\nPlease output action: 'ask_user' and summarize this data for the user."
+                
+                else:
+                    error_msg = repl_result.get("error", "Unknown error")
+                    aggregated_thoughts.append(f"> Execution failed: {error_msg}. Attempting to fix...")
+                    
+                    # Feed the error back to the LLM so it can fix its code
+                    task_memory += f"\n\n--- OBSERVATION (Code Failed) ---\nError:\n{error_msg}\n\nPlease analyze the error, fix the Python code, and output action: 'execute_code' again."
+
+        except Exception as e:
+            logger.error(f"ReAct Loop Error: {str(e)}")
+            aggregated_thoughts.append(f"> System error: {str(e)}")
+            break # Break out of loop if JSON parsing or API completely fails
+
+    # Fallback if it exceeds max iterations
+    return {
+        "thought": "\n".join(aggregated_thoughts),
+        "action": "ask_user",
+        "payload": "I tried a few times but couldn't quite get the code to run perfectly. Let me know if you want to approach this a different way.",
+        "final_code": final_code,
+        "final_data": final_data
+    }
+    # ── 2. THE LLM ROUTER (Deep Analysis) ────────────────────────
+    file_registry = context.get('file_registry', {})
+
+    # Clean up metadata to avoid token bloat in the prompt
+    lean_schema = []
+    for col in context.get('metadata', []):
+        lean_schema.append({
+            "name": col.get("name"),
+            "type": col.get("predicted_type"),
+            "description": col.get("predicted_description")
+        })
+
+    full_prompt = f"""
+    {AGENTIC_SYSTEM_PROMPT}
+
+    --- CURRENT MEMORY CONTEXT ---
+    File Registry (Use these exact paths/keys in your code):
+    {json.dumps(file_registry, indent=2)}
+
+    Active Schema:
+    {json.dumps(lean_schema, indent=2)}
+
+    Current Todo List:
+    {json.dumps(context.get('todo_list', []), indent=2)}
+
+    --- USER QUERY ---
+    {query}
+    """
+
+    try:
+        # Call the LLM
+        raw_response = call_llm(full_prompt)
+
+        # Clean the response just in case the LLM wraps it in markdown blocks
+        clean_response = raw_response.replace("```json", "").replace("```", "").strip()
+        parsed_json = json.loads(clean_response)
+        
+        # Ensure fallback defaults if the LLM misses a key
+        return {
+            "thought": parsed_json.get("thought", "> Processing complete."),
+            "todo_list": parsed_json.get("todo_list", context.get("todo_list", [])),
+            "action": parsed_json.get("action", "ask_user"),
+            "payload": parsed_json.get("payload", "")
+        }
+
+    except Exception as e:
+        logger.error(f"Orchestrator failure: {str(e)}")
+        return {
+            "thought": f"> CRITICAL ERROR in orchestrator loop:\n> {str(e)}",
+            "todo_list": context.get("todo_list", []),
+            "action": "ask_user",
+            "payload": f"I encountered a systemic error trying to process that request: `{str(e)}`"
+        }
 
 # ── Logging ──────────────────────────────────────────────
 logger = logging.getLogger("auditify.orchestrator")
