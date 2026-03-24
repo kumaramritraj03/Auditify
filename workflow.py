@@ -43,7 +43,8 @@ def _extract_file_dependencies(code: str) -> list:
 def save_workflow(code: str, semantic_requirements: list, field_mappings: dict,
                   plan: str = "", description: str = "",
                   file_dependencies: list = None,
-                  data_signatures: dict = None):
+                  data_signatures: dict = None,
+                  insights: dict = None):
     """Save a workflow for later reuse.
 
     Template strategy:
@@ -93,6 +94,7 @@ def save_workflow(code: str, semantic_requirements: list, field_mappings: dict,
         "data_signatures": data_signatures or {},  # {alias: [col, col, ...]} for role inference
         "plan": plan,
         "description": description,
+        "insights": insights or {},
     }
     path = os.path.join(WORKFLOW_DIR, f"{workflow_id}.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -113,6 +115,7 @@ def fetch_workflows():
                     "description": wf.get("description", ""),
                     "semantic_requirements": wf.get("semantic_requirements", []),
                     "file_dependencies": wf.get("file_dependencies", ["default"]),
+                    "insights": wf.get("insights", {}),
                 })
             except (json.JSONDecodeError, OSError):
                 continue

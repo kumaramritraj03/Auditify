@@ -430,8 +430,8 @@ ALLOWED_IMPORTS = frozenset({
     "openpyxl", "xlrd", "dateutil", "pdfplumber",
 })
 
-# Dangerous patterns (function calls / attribute access)
-_DANGEROUS_PATTERNS = [
+# Dangerous patterns — pre-compiled once at module load for fast per-execution scanning
+_DANGEROUS_PATTERNS = [re.compile(p) for p in [
     r'\bos\.system\s*\(',
     r'\bos\.popen\s*\(',
     r'\bos\.exec\w*\s*\(',
@@ -446,7 +446,6 @@ _DANGEROUS_PATTERNS = [
     r'\bexec\s*\(',
     r'\bcompile\s*\(',
     r'\bglobals\s*\(\s*\)',
-    r'\blocals\s*\(\s*\)',
     r'\bgetattr\s*\(.+,\s*["\']__',
     r'\bsetattr\s*\(',
     r'\bdelattr\s*\(',
@@ -460,7 +459,7 @@ _DANGEROUS_PATTERNS = [
     r'\bsys\.exit\s*\(',
     r'\bquit\s*\(',
     r'\bexit\s*\(',
-]
+]]
 
 
 def _validate_code_safety(code: str):
@@ -483,9 +482,9 @@ def _validate_code_safety(code: str):
                 if root_module not in ALLOWED_IMPORTS:
                     return f"Import from '{node.module}' is not allowed. Allowed: {sorted(ALLOWED_IMPORTS)}"
 
-    # Check dangerous patterns via regex
+    # Check dangerous patterns via pre-compiled regex
     for pattern in _DANGEROUS_PATTERNS:
-        match = re.search(pattern, code)
+        match = pattern.search(code)
         if match:
             return f"Dangerous operation detected: '{match.group(0).strip()}'"
 

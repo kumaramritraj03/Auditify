@@ -9,6 +9,7 @@ from prompts import (
     PLANNING_PROMPT,
     CODE_INSTRUCTION_PROMPT,
     CODE_GENERATION_PROMPT,
+    CODE_FIX_PROMPT,
     METADATA_PROMPT,
     DOCUMENT_PROMPT,
     MAPPING_PROMPT,
@@ -17,6 +18,10 @@ from prompts import (
     MAPPING_CLARIFICATION_PROMPT,
     DATA_SUMMARY_PROMPT,
     RESULT_SUMMARY_PROMPT,
+    GENERIC_QUERY_PROMPT,
+    INFORMATIONAL_QUERY_PROMPT,
+    WORKFLOW_ADAPTATION_PROMPT,
+    WORKFLOW_INSIGHTS_PROMPT,
 )
 def _parse_json(response: str, fallback=None):
     """Safely parse JSON from LLM response, handling markdown wrappers."""
@@ -57,16 +62,166 @@ def _extract_column_names(metadata: list) -> list:
     return [n for n in names if n]
 
 
-def classify_query(query, metadata):
-    """Classify query as informational or analytical."""
+def _build_history_str(conversation_history: list, max_turns: int = 8) -> str:
+    """Format the last N conversation turns into a plain text string for LLM prompts."""
+    lines = []
+    for msg in (conversation_history or [])[-max_turns:]:
+        role = msg.get("role", "")
+        content = str(msg.get("content", "")).strip()
+        if role in ("user", "assistant") and content and msg.get("type", "text") == "text":
+            label = "User" if role == "user" else "Auditify"
+            lines.append(f"{label}: {content[:250]}")
+    return "\n".join(lines) or "No prior conversation."
+
+
+def classify_query(query: str, metadata: list, has_data: bool = False) -> str:
+    """Classify query as 'generic', 'informational', or 'analytical'.
+
+    - generic:       Greetings, general knowledge, math, anything unrelated to loaded data.
+    - informational: Questions about data schema/profile answerable from metadata alone.
+    - analytical:    Questions requiring code execution on actual data rows.
+    """
     print("[FUNCTION] Entering classify_query")
-    prompt = QUERY_CLASSIFICATION_PROMPT.format(query=query, metadata=metadata)
-    print("[STAGE] CLASSIFICATION | [LLM CALL] Classifying query type")
+    col_names = [c.get("name", "") if isinstance(c, dict) else str(c) for c in (metadata or [])]
+    prompt = QUERY_CLASSIFICATION_PROMPT.format(
+        query=query,
+        has_data="Yes" if has_data else "No",
+        metadata=col_names[:30],  # send first 30 column names to keep prompt lean
+    )
+    print("[STAGE] CLASSIFICATION | [LLM CALL] Classifying query type (3-way)")
     response = call_llm(prompt, caller="classify_query").strip().lower().strip('"').strip("'")
-    classification = "informational" if "informational" in response else "analytical"
+    if "generic" in response:
+        classification = "generic"
+    elif "informational" in response:
+        classification = "informational"
+    else:
+        classification = "analytical"
     print(f"[STAGE] CLASSIFICATION | [FUNCTION] Result: {classification}")
     print("[FUNCTION] Exiting classify_query")
     return classification
+
+
+def answer_generic_query(query: str, conversation_history: list, data_context: str = "") -> str:
+    """Answer a generic/conversational query that does not require data analysis.
+
+    Used for: greetings, general knowledge, math questions, capability questions.
+
+    Returns:
+        Plain text string response from the LLM.
+    """
+    print("[FUNCTION] Entering answer_generic_query")
+
+    history_str = _build_history_str(conversation_history)
+
+    prompt = GENERIC_QUERY_PROMPT.format(
+        query=query,
+        data_context=data_context or "No data files loaded yet.",
+        conversation_history=history_str,
+    )
+    print("[STAGE] GENERIC | [LLM CALL] Answering generic query")
+    response = call_llm(prompt, caller="answer_generic_query").strip()
+    print(f"[STAGE] GENERIC | [FUNCTION] Response: {len(response)} chars")
+    print("[FUNCTION] Exiting answer_generic_query")
+    return response
+
+
+def answer_informational_query(query: str, metadata: list, sources: list,
+                               conversation_history: list) -> str:
+    """Answer an informational query about loaded data using metadata/schema only.
+
+    Used for: schema questions, column descriptions, data profile, analytical
+    opportunities, ambiguities, granularity — no code execution.
+
+    Returns:
+        Plain text string response from the LLM.
+    """
+    print("[FUNCTION] Entering answer_informational_query")
+
+    # Build a rich data profile from metadata + per-file summaries
+    profile_parts = []
+
+    if sources:
+        for src in sources:
+            src_name = src.get("name", "Unknown File")
+            src_cols = src.get("columns", [])
+            data_summary = src.get("data_summary", {})
+
+            profile_parts.append(f"### File: {src_name}")
+
+            # Columns table
+            if src_cols:
+                profile_parts.append("**Columns:**")
+                for col in src_cols:
+                    name  = col.get("name", "?")
+                    sem   = col.get("semantic_info", {})
+                    ctype = sem.get("predicted_type",        col.get("predicted_type", "unknown"))
+                    desc  = sem.get("predicted_description", col.get("predicted_description", ""))
+                    role  = col.get("role", "")
+                    role_str = f" | Role: {role}" if role else ""
+                    profile_parts.append(f"- `{name}` ({ctype}){role_str}: {desc}")
+
+            # Data summary fields
+            if data_summary:
+                schema_cls = data_summary.get("schema_classification", "")
+                if schema_cls:
+                    profile_parts.append(f"\n**Schema Classification:** {schema_cls}")
+
+                granularity = data_summary.get("granularity_hypothesis", "")
+                if granularity:
+                    profile_parts.append(f"**Granularity:** {granularity}")
+
+                profile = data_summary.get("dataset_context_profile", "")
+                if profile:
+                    profile_parts.append(f"**Dataset Profile:** {profile}")
+
+                role_mapping = data_summary.get("column_role_mapping", {})
+                if role_mapping:
+                    role_lines = [f"  - `{k}`: {v}" for k, v in role_mapping.items()]
+                    profile_parts.append("**Column Role Mapping:**\n" + "\n".join(role_lines))
+
+                opportunities = data_summary.get("analytical_opportunities", [])
+                if opportunities:
+                    opp_lines = [f"  - {o}" for o in opportunities]
+                    profile_parts.append("**Analytical Opportunities:**\n" + "\n".join(opp_lines))
+
+                ambiguities = data_summary.get("ambiguities", [])
+                if ambiguities:
+                    amb_lines = []
+                    for a in ambiguities:
+                        if isinstance(a, dict):
+                            amb_lines.append(f"  - [{a.get('type','?')}] {a.get('description','')}")
+                        else:
+                            amb_lines.append(f"  - {a}")
+                    profile_parts.append("**Known Ambiguities:**\n" + "\n".join(amb_lines))
+
+            profile_parts.append("")  # blank line between files
+
+    elif metadata:
+        # Fallback: no sources, use flat metadata
+        profile_parts.append("**Available Columns:**")
+        for col in metadata:
+            name  = col.get("name", "?") if isinstance(col, dict) else str(col)
+            ctype = col.get("predicted_type", "unknown") if isinstance(col, dict) else ""
+            desc  = col.get("predicted_description", "") if isinstance(col, dict) else ""
+            profile_parts.append(f"- `{name}` ({ctype}): {desc}")
+
+    data_profile = "\n".join(profile_parts) if profile_parts else "No data profile available."
+    # Cap profile size to avoid bloating the LLM prompt
+    if len(data_profile) > 8000:
+        data_profile = data_profile[:8000] + "\n... [profile truncated for brevity]"
+
+    history_str = _build_history_str(conversation_history)
+
+    prompt = INFORMATIONAL_QUERY_PROMPT.format(
+        query=query,
+        data_profile=data_profile,
+        conversation_history=history_str,
+    )
+    print("[STAGE] INFORMATIONAL | [LLM CALL] Answering informational query")
+    response = call_llm(prompt, caller="answer_informational_query").strip()
+    print(f"[STAGE] INFORMATIONAL | [FUNCTION] Response: {len(response)} chars")
+    print("[FUNCTION] Exiting answer_informational_query")
+    return response
 
 
 def generate_clarifications(query, metadata, data_summary=None, edge_cases=None,
@@ -358,19 +513,74 @@ def generate_plan(query, metadata, clarifications):
     return result
 
 
-def generate_code_instructions(plan, metadata, clarifications, file_registry: dict):
+def _build_per_file_columns(sources: list, file_registry: dict) -> str:
+    """Build a per-file column manifest string for code generation prompts.
+
+    Critical for multi-file scenarios so the LLM knows exactly which column
+    names exist in each file and doesn't hallucinate or mix them up.
+    """
+    if not sources:
+        return "No per-file column breakdown available."
+
+    lines = []
+    for src in sources:
+        src_name = src.get("name", "unknown")
+        base = src_name.rsplit(".", 1)[0] if "." in src_name else src_name
+        fallback_alias = re.sub(r"[^a-z0-9_]", "_", base.lower().strip())
+
+        # Match against file_registry: exact basename first, then exact alias, then substring
+        matched_alias = fallback_alias
+        for reg_alias, reg_path in file_registry.items():
+            if src_name == os.path.basename(reg_path):
+                matched_alias = reg_alias
+                break
+            if base.lower() == reg_alias.lower():
+                matched_alias = reg_alias
+                break
+        else:
+            for reg_alias, reg_path in file_registry.items():
+                if src_name in reg_path or base.lower() in reg_alias.lower():
+                    matched_alias = reg_alias
+                    break
+
+        cols = src.get("columns", [])
+        col_entries = []
+        for col in cols:
+            if isinstance(col, dict):
+                cname = col.get("name", "")
+                sem   = col.get("semantic_info", {})
+                ctype = sem.get("predicted_type", col.get("predicted_type", "unknown"))
+                if cname:
+                    col_entries.append(f"    - {cname} ({ctype})")
+            elif isinstance(col, str) and col:
+                col_entries.append(f"    - {col}")
+
+        if col_entries:
+            lines.append(f"  File: '{src_name}'  →  alias: \"{matched_alias}\"")
+            lines.extend(col_entries)
+            lines.append("")
+
+    return "\n".join(lines) if lines else "No per-file column breakdown available."
+
+
+def generate_code_instructions(plan, metadata, clarifications, file_registry: dict,
+                               sources: list = None, per_file_columns: str = None):
     """Generate high-level code instructions from the plan.
 
     file_registry: {alias -> absolute_path} for every available file.
+    per_file_columns: pre-built column manifest (pass from orchestrator to avoid recomputing).
     """
     print("[FUNCTION] Entering generate_code_instructions")
     column_names = _extract_column_names(metadata)
+    if per_file_columns is None:
+        per_file_columns = _build_per_file_columns(sources or [], file_registry)
     prompt = CODE_INSTRUCTION_PROMPT.format(
         plan=plan,
         metadata=metadata,
         column_names=column_names,
         clarifications=clarifications,
         file_registry=json.dumps(file_registry, indent=2),
+        per_file_columns=per_file_columns,
     )
     print("[STAGE] CODEGEN | [LLM CALL] Generating code instructions")
     result = call_llm(prompt, caller="generate_code_instructions")
@@ -379,25 +589,50 @@ def generate_code_instructions(plan, metadata, clarifications, file_registry: di
     return result
 
 
-def generate_code(instructions, metadata, file_registry: dict):
+def generate_code(instructions, metadata, file_registry: dict,
+                  sources: list = None, per_file_columns: str = None):
     """Generate executable Python code.
 
     file_registry: {alias -> absolute_path} for every available file.
+    per_file_columns: pre-built column manifest (pass from orchestrator to avoid recomputing).
     The LLM is instructed to emit  file_registry = __FILE_REGISTRY__
     as the first line — injected at execution time.
     """
     print("[FUNCTION] Entering generate_code")
     column_names = _extract_column_names(metadata)
+    if per_file_columns is None:
+        per_file_columns = _build_per_file_columns(sources or [], file_registry)
     prompt = CODE_GENERATION_PROMPT.format(
         instructions=instructions,
         metadata=metadata,
         column_names=column_names,
         file_registry=json.dumps(file_registry, indent=2),
+        per_file_columns=per_file_columns,
     )
     print("[STAGE] CODEGEN | [LLM CALL] Generating executable code")
     result = call_llm(prompt, caller="generate_code")
     print(f"[STAGE] CODEGEN | [FUNCTION] Code generated | length={len(result)} chars")
     print("[FUNCTION] Exiting generate_code")
+    return result
+
+
+def fix_code(original_code: str, error: str, file_registry: dict, metadata: list) -> str:
+    """Attempt to repair LLM-generated code that failed at runtime.
+
+    Returns fixed Python source code (without __FILE_REGISTRY__ injected).
+    """
+    print("[FUNCTION] Entering fix_code")
+    column_names = _extract_column_names(metadata)
+    prompt = CODE_FIX_PROMPT.format(
+        original_code=original_code,
+        error=error,
+        file_registry=json.dumps(file_registry, indent=2),
+        column_names=column_names,
+    )
+    print("[STAGE] CODEGEN | [LLM CALL] Repairing failed code")
+    result = call_llm(prompt, caller="fix_code")
+    print(f"[STAGE] CODEGEN | [FUNCTION] Repaired code | length={len(result)} chars")
+    print("[FUNCTION] Exiting fix_code")
     return result
 
 
@@ -1001,3 +1236,64 @@ def summarize_execution_result(user_query: str, code: str, result_data) -> dict:
 
     # Fallback: use raw response as summary
     return {"summary": response.strip()[:500], "key_metrics": []}
+
+
+def generate_workflow_insights(
+    code: str,
+    plan: str,
+    description: str,
+    semantic_requirements: list,
+) -> dict:
+    """Generate a human-readable insight card for a workflow before saving.
+
+    Returns a dict with keys: summary, expects, failure_conditions.
+    Falls back to safe empty values if LLM or parse fails.
+    """
+    reqs_str = ", ".join(semantic_requirements) if semantic_requirements else "None declared"
+    prompt = WORKFLOW_INSIGHTS_PROMPT.format(
+        description=description or "Unnamed workflow",
+        plan=plan or "No plan available.",
+        code=code[:3000],   # cap to avoid token bloat
+        semantic_requirements=reqs_str,
+    )
+    response = call_llm(prompt, caller="generate_workflow_insights")
+    result   = _parse_json(response, fallback=None)
+    if result and isinstance(result, dict):
+        return {
+            "summary":            result.get("summary", ""),
+            "expects":            result.get("expects", []),
+            "failure_conditions": result.get("failure_conditions", []),
+        }
+    return {"summary": "", "expects": [], "failure_conditions": []}
+
+
+def adapt_workflow_code(original_code: str, column_mapping: dict) -> str:
+    """Rewrite workflow code to use the user file's actual column names.
+
+    Args:
+        original_code:  Fully injected (ready-to-run) workflow code.
+        column_mapping: {original_col_name: actual_col_name_in_user_file}
+
+    Returns:
+        Adapted code string (original returned unchanged if mapping is empty).
+    """
+    if not column_mapping:
+        return original_code
+
+    mapping_lines = "\n".join(
+        f"  {orig!r} → {actual!r}" for orig, actual in column_mapping.items()
+    )
+    prompt = WORKFLOW_ADAPTATION_PROMPT.format(
+        original_code=original_code,
+        column_mapping=mapping_lines,
+    )
+    response = call_llm(prompt, caller="adapt_workflow_code")
+    code = response.strip()
+    # Strip accidental markdown fences the LLM sometimes emits
+    if code.startswith("```python"):
+        code = code[len("```python"):].lstrip("\n")
+    elif code.startswith("```"):
+        code = code[3:].lstrip("\n")
+    if code.endswith("```"):
+        code = code[:-3].rstrip()
+    return code.strip() or original_code
