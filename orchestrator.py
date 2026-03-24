@@ -428,9 +428,9 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
         print("[EXECUTION] Executing tool: classify_query")
         classification = classify_query(user_query, metadata)
         if classification == "informational":
-            return {
+             return {
                 "stage": "INFORMATIONAL",
-                "data": _answer_informational(user_query, metadata),
+                "data": _answer_informational(user_query, metadata, data_summary), # <-- Add data_summary here
                 "message": "Here is the information you requested."
             }
         questions = generate_clarifications(
@@ -724,26 +724,49 @@ def _handle_clarification_validation(_context, clarifications, column_names,
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _answer_informational(query, metadata):
-    """Answer informational queries directly from metadata."""
+def _answer_informational(query, metadata, data_summary=None):
+    """Answer informational queries directly from metadata or vision summary using Markdown."""
     query_lower = query.lower()
+
+    # --- SCENARIO A: Unstructured PDF (Has Vision Summary, but no strict tables) ---
+    if not metadata and data_summary:
+        doc_type = data_summary.get("document_type", "Document").title()
+        summary = data_summary.get("summary", "")
+        fields = data_summary.get("detected_fields", [])
+        
+        lines = [f"This appears to be a **{doc_type}**."]
+        if summary:
+            lines.append(f"**Summary:** {summary}")
+        if fields:
+            lines.append(f"**Detected Fields:** `{', '.join(fields)}`")
+            
+        return "\n\n".join(lines)
+
+    # --- SCENARIO B: Completely Empty ---
+    if not metadata:
+        return "There is no dataset currently uploaded, or the dataset is empty."
+
+    # --- SCENARIO C: Structured Data (CSV, SQL, Excel, or PDF with Tables) ---
+    total_cols = len(metadata)
+
+    # If the user asks specifically about schema, columns, or structure
     if any(word in query_lower for word in ["column", "field", "schema", "structure"]):
-        columns_info = []
+        lines = [f"I found **{total_cols} columns** in the uploaded dataset. Here is the breakdown:\n"]
+        
         for col in metadata:
+            name = col.get("name", "Unknown")
             semantic = col.get("semantic_info", {})
-            columns_info.append({
-                "name": col.get("name", ""),
-                "type": semantic.get("predicted_type", "unknown"),
-                "description": semantic.get("predicted_description", ""),
-                "samples": col.get("samples", [])[:3]
-            })
-        return {
-            "type": "schema_info",
-            "columns": columns_info,
-            "total_columns": len(columns_info)
-        }
-    return {
-        "type": "metadata_summary",
-        "total_columns": len(metadata),
-        "columns": [col.get("name", "") for col in metadata]
-    }
+            col_type = semantic.get("predicted_type", col.get("predicted_type", "unknown"))
+            desc = semantic.get("predicted_description", col.get("predicted_description", ""))
+            
+            samples = col.get("samples", [])[:3]
+            clean_samples = [str(s).replace('\n', ' ').strip() for s in samples if s]
+            sample_str = f" *(e.g., {', '.join(clean_samples)})*" if clean_samples else ""
+            
+            lines.append(f"- **`{name}`** ({col_type.title()}): {desc}{sample_str}")
+            
+        return "\n".join(lines)
+    
+    # Fallback for general structured metadata queries
+    col_names = [col.get("name", "Unknown") for col in metadata]
+    return f"The dataset contains **{total_cols} columns**: `{', '.join(col_names)}`."

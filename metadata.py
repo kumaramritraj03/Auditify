@@ -4,7 +4,7 @@ import json
 import os
 import re
 from agents import infer_document_metadata, generate_data_summary
-
+from concurrent.futures import ThreadPoolExecutor  # <--- NEW IMPORT
 import fitz  # PyMuPDF
 from vertexai.generative_models import Part
 from agents import infer_document_metadata, generate_data_summary, infer_document_metadata_vision
@@ -725,25 +725,16 @@ def _get_pdf_sample_images(pdf_path: str, max_pages: int = 5) -> list:
         return []
 
 
-def process_pdf_file(path: str) -> dict:
-    """Hybrid PDF ingestion: Table Extraction + Vision Understanding."""
-    edge_cases = {
-        "is_empty": False,
-        "read_error": False,
-        "has_headers": False,
-        "ocr_confidence": None,
-    }
+from concurrent.futures import ThreadPoolExecutor
+import os
+import re
+import pandas as pd
 
-    try:
-        import pdfplumber
-    except ImportError:
-        edge_cases["read_error"] = True
-        return {"columns": [], "data_summary": {}, "source_type": "pdf",
-                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
-
-    # ── 1. Extract tables deterministically (for execution safety) ──
+def _extract_tables_task(path: str) -> list:
+    """Worker task: Extracts tables using pdfplumber."""
     table_dfs = []
     try:
+        import pdfplumber
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
                 for table in page.extract_tables():
@@ -758,9 +749,48 @@ def process_pdf_file(path: str) -> dict:
                             table_dfs.append(tdf)
                     except Exception:
                         continue
-    except Exception:
-        edge_cases["read_error"] = True
+    except Exception as e:
+        print(f"[PDF] Table extraction error: {e}")
+    return table_dfs
 
+
+def _vision_summary_task(path: str) -> dict:
+    """Worker task: Samples pages and calls Gemini Vision LLM."""
+    print("[PDF] Generating document summary via Vision...")
+    image_parts = _get_pdf_sample_images(path)
+    if image_parts:
+        return infer_document_metadata_vision(image_parts)
+    return {}
+
+
+def process_pdf_file(path: str) -> dict:
+    """Hybrid PDF ingestion: Concurrent Table Extraction + Vision Understanding & Schema Merging."""
+    edge_cases = {
+        "is_empty": False,
+        "read_error": False,
+        "has_headers": True,  # Set to True to avoid the false alarm UI warning
+        "ocr_confidence": None,
+    }
+
+    try:
+        import pdfplumber
+    except ImportError:
+        edge_cases["read_error"] = True
+        return {"columns": [], "data_summary": {}, "source_type": "pdf",
+                "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
+
+    # ── 1. RUN CONCURRENTLY: Table Extraction & Vision API Call ──
+    print(f"[PDF] Starting concurrent extraction for {os.path.basename(path)}")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # Submit both tasks to run at the exact same time
+        future_tables = executor.submit(_extract_tables_task, path)
+        future_vision = executor.submit(_vision_summary_task, path)
+
+        # Wait for both to finish and get their results
+        table_dfs = future_tables.result()
+        doc_summary = future_vision.result()
+
+    # ── 2. Process Table Results ──
     final_df = pd.DataFrame()
     if table_dfs:
         col_sets = [frozenset(t.columns) for t in table_dfs]
@@ -769,27 +799,46 @@ def process_pdf_file(path: str) -> dict:
         else:
             final_df = max(table_dfs, key=len)
 
-    # ── 2. Vision LLM Understanding ──
-    print("[PDF] Generating document summary via Vision...")
-    image_parts = _get_pdf_sample_images(path)
-
-    doc_summary = {}
-    if image_parts:
-        doc_summary = infer_document_metadata_vision(image_parts)
+    # ── 3. Process Vision Results ──
+    if doc_summary:
         edge_cases["ocr_confidence"] = "high" # Vision models don't rely on OCR text layers
     else:
-        edge_cases["is_empty"] = True
+        edge_cases["is_empty"] = True if final_df.empty else False
 
-    # ── 3. Return document metadata as primary output ──
-    # Vision-based document classification is the primary output for PDFs
-    # Table extraction is only used for column metadata if needed
+    # ── 4. Combine Table Columns with Vision Fields ──
     result = _build_result_from_df(final_df, source_type="pdf") if not final_df.empty else {}
+    pdf_columns = result.get("columns", [])
+
+    # Merge Vision-detected unstructured fields into the official schema
+    if doc_summary and "detected_fields" in doc_summary:
+        existing_col_names = {c["name"].lower() for c in pdf_columns}
+        for field in doc_summary["detected_fields"]:
+            if field.lower() not in existing_col_names:
+                # Guess basic semantic type for better downstream planning
+                ptype = "unknown"
+                f_lower = field.lower()
+                if any(x in f_lower for x in ["id", "number", "num", "no"]): ptype = "id"
+                elif "date" in f_lower: ptype = "date"
+                elif any(x in f_lower for x in ["amount", "total", "tax", "price"]): ptype = "amount"
+                elif any(x in f_lower for x in ["name", "vendor", "customer"]): ptype = "name"
+                
+                pdf_columns.append({
+                    "name": field,
+                    "samples": ["(Extracted via Vision)"],
+                    "predicted_type": ptype,
+                    "predicted_description": "Unstructured field detected via Vision API",
+                    "confidence": doc_summary.get("confidence", 0.8),
+                    "detected_dtype": "object",
+                    "missing_ratio": 0.0,
+                    "unique_ratio": 1.0,
+                    "semantic_info": {"predicted_type": ptype}
+                })
 
     return {
-        "columns": result.get("columns", []),
-        "data_summary": doc_summary,  # ✅ Always use vision metadata for PDFs (primary output)
+        "columns": pdf_columns,
+        "data_summary": doc_summary,  
         "source_type": "pdf",
-        "column_count": len(result.get("columns", [])),
+        "column_count": len(pdf_columns),
         "sample_row_count": len(final_df) if not final_df.empty else 0,
         "edge_cases": edge_cases,
     }

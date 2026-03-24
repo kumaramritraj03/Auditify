@@ -521,11 +521,12 @@ STRICT FILE RULES:
 MANDATORY RULES (follow ALL of these):
 
 1. NO FULL DATA ASSUMPTION
+    1. NO FULL DATA ASSUMPTION
    - NEVER do: df = pd.read_csv("file.csv") blindly
    - PREFER: DuckDB ingestion or chunked reading
-   - For .xlsx/.xls: use pd.read_excel() then register with DuckDB
+   - For .xlsx/.xls files: load with pd.read_excel(path) first, then register with DuckDB
    - For .csv: use duckdb.read_csv_auto('path') directly
-
+   - For .pdf files: import pdfplumber, extract tables from all pages, combine into a single pandas DataFrame, clean headers (replace spaces with underscores), drop fully NA rows, then con.register("name", df).
 2. USE CANONICAL FIELD NAMES
    - Before any logic, rename columns if needed:
      df = df.rename(columns={{actual_col: semantic_col}})
@@ -598,6 +599,7 @@ EXECUTION ENVIRONMENT:
 - Close DuckDB connections right after fetching, NOT in finally blocks.
 
 CRITICAL DuckDB API RULES (violating these will cause runtime errors):
+NEVER catch `duckdb.DuckDBError` (it does not exist!). If you must use try/except, use `duckdb.Error` or standard `Exception`.
 - NEVER use `.fetchval()` — it does NOT exist in DuckDB Python API.
 - To get a single scalar value: `con.execute(query).fetchone()[0]`
 - To get a DataFrame: `con.execute(query).fetchdf()`

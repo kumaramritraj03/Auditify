@@ -427,7 +427,7 @@ ALLOWED_IMPORTS = frozenset({
     "pandas", "pd", "numpy", "np", "duckdb", "json", "os", "datetime",
     "math", "re", "collections", "itertools", "functools", "decimal",
     "csv", "io", "pathlib", "typing", "warnings", "statistics",
-    "openpyxl", "xlrd", "dateutil",
+    "openpyxl", "xlrd", "dateutil", "pdfplumber",
 })
 
 # Dangerous patterns (function calls / attribute access)
@@ -535,6 +535,12 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
             import numpy as np
             _ns["np"] = np
             _ns["numpy"] = np
+        except ImportError:
+            pass
+                                  
+        try:
+            import pdfplumber
+            _ns["pdfplumber"] = pdfplumber
         except ImportError:
             pass
 
