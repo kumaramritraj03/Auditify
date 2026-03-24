@@ -16,6 +16,7 @@ from prompts import (
     WORKFLOW_SEMANTIC_PROMPT,
     MAPPING_CLARIFICATION_PROMPT,
     DATA_SUMMARY_PROMPT,
+    RESULT_SUMMARY_PROMPT,
 )
 
 from vertex_client import call_llm, call_multimodal_llm
@@ -718,31 +719,152 @@ def infer_file_roles(
 def infer_document_metadata_vision(image_parts: list) -> dict:
     """Uses Gemini Vision to analyze sampled pages and return document metadata."""
     prompt = """
-    You are analyzing sampled pages from a larger PDF document for an audit system.
-    Your task: Identify what type of document this is and extract key field names visible on the pages.
+You are an expert Document Intelligence Engine for an audit system.
 
-    TASK:
-    1. Classify the document type (invoice, receipt, expense report, bill, purchase order, contract, report, statement, etc.)
-    2. Identify all key fields/columns you can see (e.g., invoice_number, amount, date, vendor_name, etc.)
-    3. Rate your confidence in the classification (0.0 to 1.0, where 1.0 is certain)
-    4. Provide a brief summary of what the document contains
+You are analyzing sampled pages from a larger PDF document.
+Your task is to extract a COMPLETE, ACCURATE, and STRUCTURED understanding of the document based ONLY on visible evidence.
 
-    FIELD DETECTION RULES:
-    - Look for headers, labels, and column names in tables
-    - Extract visible field names exactly as shown (e.g., "Invoice #", "Bill Amount", "Date")
-    - Convert field names to snake_case format
-    - Include at least 3-5 key fields if visible
+---
 
-    Return ONLY valid JSON matching this exact schema:
-    {
-        "document_type": "string (the document classification)",
-        "summary": "string (1-2 sentences describing document content)",
-        "detected_fields": ["field1", "field2", "field3"],
-        "confidence": 0.85
-    }
+## 🎯 TASK
 
-    IMPORTANT: Return ONLY JSON, no other text. Do NOT wrap in markdown code blocks.
-    """
+1. Classify the document type (invoice, receipt, expense report, bill, purchase order, contract, report, statement, etc.)
+2. Extract metadata for ALL visible fields/columns (do NOT limit yourself)
+3. For EACH detected field, extract:
+   - name (snake_case)
+   - type (text, numeric, amount, date, identifier, category, percentage, boolean, address, email, phone)
+   - description (specific to THIS document)
+   - sample_value (must be taken from visible content; do NOT fabricate)
+   - confidence (0.0 to 1.0)
+4. Separate fields into:
+   - header_fields (document-level information)
+   - line_item_fields (table/row-level information)
+5. Generate a RICH, evidence-based summary (40–80 words)
+6. Suggest analytical_opportunities (audit-focused, based on detected fields)
+7. Assign overall confidence score
+
+---
+
+## 🔍 FIELD DETECTION RULES
+
+• Extract ALL meaningful fields — do NOT stop at minimum count  
+• Prioritize audit-critical fields:
+  - invoice_number / bill_number
+  - vendor_name / supplier_name
+  - date fields
+  - total_amount / tax / subtotal
+• Detect both:
+  - key-value pairs
+  - table columns
+
+---
+
+## 🔄 NORMALIZATION RULES
+
+Convert field names to snake_case.
+
+Examples:
+- "Invoice #" → invoice_number
+- "GST (18%)" → tax
+- "Total Amount" → total_amount
+
+Use semantic understanding, not literal copying.
+
+---
+
+## 🧠 TYPE INFERENCE RULES
+
+- Monetary → amount
+- IDs/codes → identifier
+- Dates → date
+- Quantities → numeric
+- Categories → category
+- Free text → text
+
+---
+
+## 📊 CONFIDENCE RULES
+
+- Base confidence ONLY on visible clarity and structure
+- Do NOT assign low confidence due to uncertainty — infer best possible answer
+- Avoid extreme values unless clearly justified
+
+---
+
+## 🧾 SUMMARY RULES
+
+The summary MUST:
+- Reference actual detected values (e.g., invoice number, vendor, totals)
+- Describe structure (line items, totals, etc.)
+- Explain audit relevance (financial validation, reconciliation potential)
+- Be specific — NOT generic
+
+---
+
+## 📈 ANALYTICAL OPPORTUNITIES RULES
+
+Generate 3–7 meaningful audit analyses based on detected fields.
+
+Each must:
+- Reference actual field names
+- Be actionable (not vague)
+- Reflect real audit use cases (validation, reconciliation, anomaly detection, trend analysis)
+
+---
+
+## 🚫 STRICT CONSTRAINTS
+
+DO NOT:
+- invent fields not visible
+- fabricate sample values
+- return placeholders like "unknown", "N/A", or empty fields
+- hardcode number of fields or opportunities
+- copy examples blindly
+
+---
+
+## 📦 OUTPUT FORMAT
+
+Return a VALID JSON object with the following structure:
+
+{
+    "document_type": "<inferred document type>",
+    "summary": "<rich, evidence-based summary>",
+    "detected_fields": {
+        "header_fields": [
+            {
+                "name": "<field_name>",
+                "type": "<field_type>",
+                "description": "<field_description>",
+                "sample_value": "<actual_sample_value>",
+                "confidence": <float>
+            }
+        ],
+        "line_item_fields": [
+            {
+                "name": "<field_name>",
+                "type": "<field_type>",
+                "description": "<field_description>",
+                "sample_value": "<actual_sample_value>",
+                "confidence": <float>
+            }
+        ]
+    },
+    "analytical_opportunities": [
+        "<audit analysis 1>",
+        "<audit analysis 2>"
+    ],
+    "confidence": <float>
+}
+
+---
+
+## ⚠️ FINAL INSTRUCTION
+
+Return ONLY valid JSON.
+The output MUST reflect ONLY the provided document content.
+Do NOT include explanations, markdown, or extra text.
+"""
 
     # Combine the prompt string and the image Part objects
     contents = [prompt] + image_parts
@@ -763,18 +885,121 @@ def infer_document_metadata_vision(image_parts: list) -> dict:
         # Ensure all required fields are present and properly typed
         document_type = str(result.get("document_type", "unknown")).strip().lower()
         summary = str(result.get("summary", "")).strip()
-        detected_fields = result.get("detected_fields", [])
-        if not isinstance(detected_fields, list):
-            detected_fields = [detected_fields] if detected_fields else []
+        detected_fields = result.get("detected_fields", {})
         confidence = float(result.get("confidence", 0.5))
         confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+
+        # Normalize detected_fields into the rich dict format
+        if isinstance(detected_fields, dict):
+            # New format: {"header_fields": [...], "line_item_fields": [...]}
+            for section in ("header_fields", "line_item_fields"):
+                items = detected_fields.get(section, [])
+                normalized = []
+                for item in items:
+                    if isinstance(item, dict):
+                        normalized.append({
+                            "name": str(item.get("name", "")).strip(),
+                            "type": str(item.get("type", "unknown")).strip().lower(),
+                            "description": str(item.get("description", "")).strip(),
+                            "sample_value": str(item.get("sample_value", "")).strip(),
+                            "confidence": max(0.0, min(1.0, float(item.get("confidence", 0.7)))),
+                        })
+                    elif isinstance(item, str) and item.strip():
+                        normalized.append({
+                            "name": item.strip(),
+                            "type": "unknown",
+                            "description": "",
+                            "sample_value": "",
+                            "confidence": 0.7,
+                        })
+                detected_fields[section] = [f for f in normalized if f["name"]]
+        elif isinstance(detected_fields, list):
+            # Legacy flat list — wrap into header_fields
+            normalized = []
+            for item in detected_fields:
+                if isinstance(item, dict):
+                    normalized.append({
+                        "name": str(item.get("name", "")).strip(),
+                        "type": str(item.get("type", "unknown")).strip().lower(),
+                        "description": str(item.get("description", "")).strip(),
+                        "sample_value": str(item.get("sample_value", "")).strip(),
+                        "confidence": max(0.0, min(1.0, float(item.get("confidence", 0.7)))),
+                    })
+                elif isinstance(item, str) and item.strip():
+                    normalized.append({
+                        "name": item.strip(),
+                        "type": "unknown",
+                        "description": "",
+                        "sample_value": "",
+                        "confidence": 0.7,
+                    })
+            detected_fields = {"header_fields": [f for f in normalized if f["name"]], "line_item_fields": []}
+        else:
+            detected_fields = {"header_fields": [], "line_item_fields": []}
+
+        # Extract analytical opportunities
+        opportunities = result.get("analytical_opportunities", [])
+        if not isinstance(opportunities, list):
+            opportunities = [opportunities] if opportunities else []
+        opportunities = [str(o).strip() for o in opportunities if o]
 
         return {
             "document_type": document_type,
             "summary": summary,
-            "detected_fields": [str(f).strip() for f in detected_fields if f],
+            "detected_fields": detected_fields,
+            "analytical_opportunities": opportunities,
             "confidence": confidence
         }
     except Exception as e:
         print(f"[AGENT] Failed to parse vision JSON: {e} | response: {response_text[:200]}")
-        return {"document_type": "unknown", "summary": "", "detected_fields": [], "confidence": 0.0}
+        return {"document_type": "unknown", "summary": "", "detected_fields": [], "analytical_opportunities": [], "confidence": 0.0}
+
+
+# ── Result Summarizer ─────────────────────────────────────
+
+def summarize_execution_result(user_query: str, code: str, result_data) -> dict:
+    """
+    Takes the user query, executed code, and raw output — returns a
+    human-readable summary + key metrics via LLM.
+    """
+    # Serialize the output for the prompt
+    if isinstance(result_data, list):
+        # Truncate large tables to first 30 rows for the prompt
+        truncated = result_data[:30]
+        output_str = json.dumps(truncated, indent=2, default=str)
+        if len(result_data) > 30:
+            output_str += f"\n... ({len(result_data)} total rows, showing first 30)"
+    elif isinstance(result_data, dict):
+        # For dict results, serialize each value
+        serialized = {}
+        for k, v in result_data.items():
+            if isinstance(v, list) and len(v) > 30:
+                serialized[k] = v[:30]
+                serialized[f"_{k}_total_rows"] = len(v)
+            else:
+                serialized[k] = v
+        output_str = json.dumps(serialized, indent=2, default=str)
+    else:
+        output_str = str(result_data)[:5000]
+
+    # Cap total output to avoid token overflow
+    if len(output_str) > 8000:
+        output_str = output_str[:8000] + "\n... (truncated)"
+
+    prompt = RESULT_SUMMARY_PROMPT.format(
+        user_query=user_query,
+        code=code[:3000],  # Cap code length too
+        output=output_str,
+    )
+
+    response = call_llm(prompt, caller="summarize_result")
+    parsed = _parse_json(response)
+
+    if parsed and isinstance(parsed, dict):
+        return {
+            "summary": parsed.get("summary", ""),
+            "key_metrics": parsed.get("key_metrics", []),
+        }
+
+    # Fallback: use raw response as summary
+    return {"summary": response.strip()[:500], "key_metrics": []}

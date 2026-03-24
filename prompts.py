@@ -585,14 +585,23 @@ MANDATORY RULES (follow ALL of these):
       type conversion fails critically, too many nulls
     - NO silent failures
 
-14. RESULT VARIABLE
+14. BANNED OPERATIONS (will cause safety violations)
+    - NEVER use exit(), quit(), or sys.exit() — these are BLOCKED by the sandbox
+    - If you need to stop early (e.g., empty data after join), set `result` to an
+      empty DataFrame or dict with empty DataFrames and skip remaining logic
+    - Example: instead of exit(), do:
+      result = pd.DataFrame()  # or a dict of empty DataFrames
+      # then skip further processing with if/else blocks
+
+15. RESULT VARIABLE
     - Output MUST define a final variable named `result`
     - `result` should be a pandas DataFrame or list of dicts
 
 EXECUTION ENVIRONMENT:
 - Code runs as a standalone Python script (like `python script.py`).
-- `pandas as pd`, `duckdb`, `os`, `json`, `datetime` are already imported.
+- `pandas as pd`, `duckdb`, `os`, `json`, `re`, `datetime` are already imported.
   You may import them again if you want — it won't cause errors.
+- ALWAYS add `import re` at the top of your code if you use regex operations.
 - Keep code flat and simple. Avoid unnecessary try/except/finally blocks.
 - Do NOT wrap ALL code in a giant try/except — let errors propagate naturally.
 - Do NOT use `if 'con' in locals()` patterns.
@@ -1027,4 +1036,49 @@ RULE E: data_signatures for future workflow compatibility.
   - After loading each file, log which columns are present:
     print(f"[alias] columns: {{list(df.columns)}}")
   - This enables future auto-mapping on replay.
+"""
+
+
+RESULT_SUMMARY_PROMPT = """You are Auditify's result interpreter. Your job is to take the executed code and its output, and produce a clear, human-friendly summary that a non-technical auditor can understand.
+
+## INPUT
+- **User Query**: What the user originally asked.
+- **Executed Code**: The Python code that was run.
+- **Execution Output**: The raw result (tables, numbers, dicts, etc.).
+
+## RULES
+1. Write a SHORT summary (3-5 sentences max) explaining what was done and what the key findings are.
+2. Highlight the most important numbers, totals, counts, or patterns — reference actual values from the output.
+3. If the output is a table/DataFrame, mention row count, key columns, and any standout values (min, max, top entries).
+4. If the output contains matches/mismatches (e.g., reconciliation), clearly state how many matched vs. unmatched.
+5. Use plain business language — no code jargon, no variable names, no technical terms like "DataFrame" or "DuckDB".
+6. If something looks unusual or noteworthy (outliers, zeros, large gaps), flag it as a potential finding.
+7. End with one actionable next-step suggestion if relevant.
+
+## OUTPUT FORMAT
+Return ONLY a JSON object:
+```json
+{{
+  "summary": "Your 3-5 sentence human-readable summary here.",
+  "key_metrics": [
+    {{"label": "metric name", "value": "metric value"}},
+    ...
+  ]
+}}
+```
+
+- `key_metrics`: 2-5 of the most important numbers/facts extracted from the output. Keep labels short (2-4 words).
+
+## CONTEXT
+
+**User Query:**
+{user_query}
+
+**Executed Code:**
+```python
+{code}
+```
+
+**Execution Output:**
+{output}
 """

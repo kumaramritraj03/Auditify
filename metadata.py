@@ -812,22 +812,47 @@ def process_pdf_file(path: str) -> dict:
     # Merge Vision-detected unstructured fields into the official schema
     if doc_summary and "detected_fields" in doc_summary:
         existing_col_names = {c["name"].lower() for c in pdf_columns}
-        for field in doc_summary["detected_fields"]:
-            if field.lower() not in existing_col_names:
-                # Guess basic semantic type for better downstream planning
+        raw_fields = doc_summary["detected_fields"]
+
+        # Flatten: {"header_fields": [...], "line_item_fields": [...]} → flat list with section tag
+        if isinstance(raw_fields, dict):
+            field_list = []
+            for section, items in raw_fields.items():
+                if isinstance(items, list):
+                    for item in items:
+                        field_list.append((item, section))
+        elif isinstance(raw_fields, list):
+            field_list = [(f, None) for f in raw_fields]
+        else:
+            field_list = []
+
+        for field_obj, section_tag in field_list:
+            if isinstance(field_obj, dict):
+                field_name = field_obj.get("name", "")
+                ptype = field_obj.get("type", "unknown")
+                desc = field_obj.get("description", "")
+                sample = field_obj.get("sample_value", "")
+                field_conf = field_obj.get("confidence", doc_summary.get("confidence", 0.8))
+            else:
+                field_name = str(field_obj).strip()
                 ptype = "unknown"
-                f_lower = field.lower()
-                if any(x in f_lower for x in ["id", "number", "num", "no"]): ptype = "id"
-                elif "date" in f_lower: ptype = "date"
-                elif any(x in f_lower for x in ["amount", "total", "tax", "price"]): ptype = "amount"
-                elif any(x in f_lower for x in ["name", "vendor", "customer"]): ptype = "name"
-                
+                desc = ""
+                sample = ""
+                field_conf = doc_summary.get("confidence", 0.8)
+
+            if not desc:
+                section_label = section_tag.replace("_", " ").title() if section_tag else "Vision API"
+                desc = f"Detected via {section_label}"
+
+            samples = [sample] if sample else ["(Extracted via Vision)"]
+
+            if field_name and field_name.lower() not in existing_col_names:
                 pdf_columns.append({
-                    "name": field,
-                    "samples": ["(Extracted via Vision)"],
+                    "name": field_name,
+                    "samples": samples,
                     "predicted_type": ptype,
-                    "predicted_description": "Unstructured field detected via Vision API",
-                    "confidence": doc_summary.get("confidence", 0.8),
+                    "predicted_description": desc,
+                    "confidence": field_conf,
                     "detected_dtype": "object",
                     "missing_ratio": 0.0,
                     "unique_ratio": 1.0,
@@ -842,7 +867,6 @@ def process_pdf_file(path: str) -> dict:
         "sample_row_count": len(final_df) if not final_df.empty else 0,
         "edge_cases": edge_cases,
     }
-
 def process_sql_source(connection_config: dict) -> dict:
     """Fetch metadata from a SQL database connection.
 

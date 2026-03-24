@@ -19,7 +19,7 @@ from metadata import extract_structured_metadata, process_pdf_file
 from orchestrator import handle_query_v2
 from workflow import fetch_workflows, get_workflow, save_workflow
 from execution import execute_code, execute_code_repl
-from agents import extract_workflow_semantics, map_fields, infer_file_roles
+from agents import extract_workflow_semantics, map_fields, infer_file_roles, summarize_execution_result
 from file_registry import register_file, get_all_files
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -390,11 +390,33 @@ with st.sidebar:
 
                 detected_fields = src_summary.get("detected_fields", [])
                 if detected_fields:
-                    st.markdown(f"**Detected Fields:**")
-                    field_cols = st.columns(min(3, len(detected_fields)))
-                    for idx, field in enumerate(detected_fields):
-                        with field_cols[idx % 3]:
-                            st.write(f"• {field}")
+                    if isinstance(detected_fields, dict):
+                        with st.expander("Detected Fields (Vision)", expanded=False):
+                            for section_key, items in detected_fields.items():
+                                if isinstance(items, list) and items:
+                                    label = section_key.replace("_", " ").title()
+                                    st.markdown(f"**{label}**")
+                                    if isinstance(items[0], dict):
+                                        field_rows = []
+                                        for f in items:
+                                            field_rows.append({
+                                                "Field": f.get("name", ""),
+                                                "Type": f.get("type", "unknown"),
+                                                "Description": f.get("description", ""),
+                                                "Example": f.get("sample_value", ""),
+                                            })
+                                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
+                                    else:
+                                        cols = st.columns(min(3, len(items)))
+                                        for idx, field in enumerate(items):
+                                            with cols[idx % 3]:
+                                                st.write(f"• {field}")
+                    else:
+                        st.markdown(f"**Detected Fields:**")
+                        field_cols = st.columns(min(3, len(detected_fields)))
+                        for idx, field in enumerate(detected_fields):
+                            with field_cols[idx % 3]:
+                                st.write(f"• {field}")
 
                 # Legacy: Topics and entities (if present)
                 topics = src_summary.get("primary_topics", [])
@@ -600,18 +622,36 @@ def render_messages():
 
 
 def _render_result_data(result_data):
-    """Render execution result as a table if possible."""
+    """Render execution result with human-readable summary + raw data."""
+    # ── Render LLM summary if available ──
+    summary_text = result_data.get("summary", "")
+    key_metrics = result_data.get("key_metrics", [])
+
+    if summary_text and summary_text != "Execution successful":
+        st.markdown(f"**Summary:** {summary_text}")
+
+        if key_metrics:
+            cols = st.columns(min(len(key_metrics), 5))
+            for i, metric in enumerate(key_metrics):
+                with cols[i % len(cols)]:
+                    st.metric(
+                        label=metric.get("label", ""),
+                        value=metric.get("value", ""),
+                    )
+
+    # ── Render raw data in an expander ──
     result = result_data.get("result")
     if result is None:
         return
 
-    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
-        df = pd.DataFrame(result)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    elif isinstance(result, dict):
-        st.json(result)
-    else:
-        st.write(result)
+    with st.expander("View Detailed Results", expanded=False):
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
+            df = pd.DataFrame(result)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        elif isinstance(result, dict):
+            st.json(result)
+        else:
+            st.write(result)
 
 
 # ── Stage: Choose workflow or new query ────────────────────
@@ -926,10 +966,20 @@ elif st.session_state.stage == "EXECUTING":
     if repl_result["status"] == "success":
         status_container.success("Execution completed successfully!")
 
+        # ── Generate human-readable summary via LLM ──
+        user_query = st.session_state.context.get("user_query", "")
+        with st.spinner("Generating summary..."):
+            result_summary = summarize_execution_result(
+                user_query=user_query,
+                code=code,
+                result_data=repl_result["result"],
+            )
+
         # Build legacy-compatible result for downstream
         exec_data = {
             "result": repl_result["result"],
-            "summary": "Execution successful",
+            "summary": result_summary.get("summary", "Execution successful"),
+            "key_metrics": result_summary.get("key_metrics", []),
             "error": None,
             "logs": "\n".join(logs),
         }
@@ -1690,10 +1740,24 @@ elif st.session_state.stage == "WORKFLOW_EXECUTE":
     else:
         step_container.caption("No steps recorded.")
 
-    # Build legacy-compatible result
+    # ── Generate human-readable summary for workflow results ──
+    if repl_result["status"] == "success":
+        wf_query = st.session_state.context.get("user_query", "")
+        if not wf_query:
+            wf_query = st.session_state.get("selected_workflow", {}).get("description", "Workflow execution")
+        with st.spinner("Generating summary..."):
+            wf_summary = summarize_execution_result(
+                user_query=wf_query,
+                code=workflow_code,
+                result_data=repl_result["result"],
+            )
+    else:
+        wf_summary = {"summary": "Execution failed", "key_metrics": []}
+
     exec_data = {
         "result": repl_result["result"],
-        "summary": "Execution successful" if repl_result["status"] == "success" else "Execution failed",
+        "summary": wf_summary.get("summary", "Execution successful") if repl_result["status"] == "success" else "Execution failed",
+        "key_metrics": wf_summary.get("key_metrics", []),
         "error": repl_result.get("error"),
         "logs": "\n".join(logs),
     }

@@ -520,12 +520,15 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
         import duckdb
         import os
 
+        import re
+
         # Shared namespace for all chunks
         _ns = {
             "pd": pd, "pandas": pd,
             "duckdb": duckdb,
             "os": os,
             "json": json,
+            "re": re,
             "datetime": datetime,
             "__builtins__": __builtins__,
         }

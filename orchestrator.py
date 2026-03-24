@@ -733,12 +733,23 @@ def _answer_informational(query, metadata, data_summary=None):
         doc_type = data_summary.get("document_type", "Document").title()
         summary = data_summary.get("summary", "")
         fields = data_summary.get("detected_fields", [])
-        
+
         lines = [f"This appears to be a **{doc_type}**."]
         if summary:
             lines.append(f"**Summary:** {summary}")
         if fields:
-            lines.append(f"**Detected Fields:** `{', '.join(fields)}`")
+            if isinstance(fields, dict):
+                for section, items in fields.items():
+                    label = section.replace("_", " ").title()
+                    if items:
+                        if isinstance(items[0], dict):
+                            field_strs = [f.get("name", "") for f in items if f.get("name")]
+                        else:
+                            field_strs = [str(f) for f in items]
+                        if field_strs:
+                            lines.append(f"**{label}:** `{', '.join(field_strs)}`")
+            else:
+                lines.append(f"**Detected Fields:** `{', '.join(str(f) for f in fields)}`")
             
         return "\n\n".join(lines)
 
