@@ -169,6 +169,7 @@ with st.sidebar:
         st.divider()
 
     # ── Global File Upload ────────────────
+    # ── Global File Upload ────────────────
     st.subheader("Inject Data Context")
     uploaded_files = st.file_uploader(
         "Upload files mid-chat to update the agent's context.",
@@ -177,6 +178,252 @@ with st.sidebar:
     )
 
     if uploaded_files:
+        # Stop the infinite loop! Only process files we haven't seen yet.
+        already_processed = {s.get("name") for s in st.session_state.sources}
+        new_files = [uf for uf in uploaded_files if uf.name not in already_processed]
+        
+        if new_files:
+            with st.spinner(f"Processing {len(new_files)} new file(s)..."):
+                saved = []
+                for uf in new_files:
+                    file_type, local_path, file_id = save_uploaded_file(uf)
+                    if file_type is not None:
+                        saved.append({"name": uf.name, "type": file_type, "path": local_path, "id": file_id})
+
+                if saved:
+                    for s in saved:
+                        register_file(s["id"], s["name"], s["path"], source="upload")
+
+                    def _extract_one(item):
+                        return {**item, "result": extract_metadata(item["type"], item["path"])}
+
+                    with ThreadPoolExecutor(max_workers=min(len(saved), 4)) as executor:
+                        processed = list(executor.map(_extract_one, saved))
+
+                    all_columns, all_sources = [], []
+                    built_registry = st.session_state.file_registry
+
+                    for item in processed:
+                        result = item["result"]
+                        cols = result.get("columns", [])
+                        all_columns.extend(cols)
+                        all_sources.append({
+                            "source_id": item["id"], "name": item["name"],
+                            "type": item["type"], "path": item["path"],
+                            "column_count": len(cols), "columns": cols,
+                            "data_summary": result.get("data_summary", {}),
+                            "edge_cases": result.get("edge_cases", {}),
+                        })
+                        stem = os.path.splitext(item["name"])[0].lower().replace(" ", "_")
+                        alias = stem
+                        counter = 2
+                        while alias in built_registry:
+                            alias = f"{stem}_{counter}"
+                            counter += 1
+                        built_registry[alias] = item["path"]
+
+                    st.session_state.metadata.extend(all_columns)
+                    st.session_state.sources.extend(all_sources)
+                    st.session_state.file_registry = built_registry
+                    st.session_state.uploaded = True
+                    
+                    # Notify the chat quietly
+                    file_names_str = ", ".join([s.get("name") for s in all_sources])
+                    add_message("assistant", f"I have successfully received and scanned your file(s): **{file_names_str}**. You can view the profiles in the sidebar.")
+                    
+                    # Rerun to break loop and update UI
+                    st.rerun()
+
+    # Render Dataset Profiles in the sidebar (like your GitHub repo)
+    if st.session_state.sources:
+        st.divider()
+        st.markdown("### 📊 Dataset Profiles")
+        for src in st.session_state.sources:
+            name = src.get("name", "Unknown")
+            summary_data = src.get("data_summary", {})
+            
+            with st.expander(f"Dataset: {name}", expanded=False):
+                context_profile = summary_data.get("dataset_context_profile", "")
+                doc_summary = summary_data.get("summary", "")
+                
+                if context_profile: 
+                    st.markdown(f"_{context_profile}_")
+                elif doc_summary:
+                    st.markdown(f"_{doc_summary}_")
+                
+                schema = summary_data.get("schema_classification", {})
+                if schema:
+                    st.markdown("**Schema Classification:**")
+                    for role, cols in schema.items():
+                        if cols: 
+                            st.markdown(f"- **{role.replace('_', ' ').title()}**: {', '.join(cols)}") 
+        already_processed = {s.get("name") for s in st.session_state.sources}
+        new_files = [uf for uf in uploaded_files if uf.name not in already_processed]
+        
+        if new_files:
+            with st.spinner(f"Processing {len(new_files)} new file(s)..."):
+                saved = []
+                for uf in new_files:
+                    file_type, local_path, file_id = save_uploaded_file(uf)
+                    if file_type is not None:
+                        saved.append({"name": uf.name, "type": file_type, "path": local_path, "id": file_id})
+
+                if saved:
+                    for s in saved:
+                        register_file(s["id"], s["name"], s["path"], source="upload")
+
+                    def _extract_one(item):
+                        return {**item, "result": extract_metadata(item["type"], item["path"])}
+
+                    with ThreadPoolExecutor(max_workers=min(len(saved), 4)) as executor:
+                        processed = list(executor.map(_extract_one, saved))
+
+                    all_columns, all_sources = [], []
+                    built_registry = st.session_state.file_registry
+
+                    for item in processed:
+                        result = item["result"]
+                        cols = result.get("columns", [])
+                        all_columns.extend(cols)
+                        all_sources.append({
+                            "source_id": item["id"], "name": item["name"],
+                            "type": item["type"], "path": item["path"],
+                            "column_count": len(cols), "columns": cols,
+                            "data_summary": result.get("data_summary", {}),
+                            "edge_cases": result.get("edge_cases", {}),
+                        })
+                        stem = os.path.splitext(item["name"])[0].lower().replace(" ", "_")
+                        alias = stem
+                        counter = 2
+                        while alias in built_registry:
+                            alias = f"{stem}_{counter}"
+                            counter += 1
+                        built_registry[alias] = item["path"]
+
+                    st.session_state.metadata.extend(all_columns)
+                    st.session_state.sources.extend(all_sources)
+                    st.session_state.file_registry = built_registry
+                    st.session_state.uploaded = True
+                    st.session_state.stage = "AGENT_CHAT"
+                    
+                    # 2. Render the actual dataset profile into the chat window
+                    profile_md = f"### 📊 Dataset Profiles Generated ({len(all_sources)} files)\n\n"
+                    for src in all_sources:
+                        name = src.get("name", "Unknown")
+                        summary_data = src.get("data_summary", {})
+                        
+                        context_profile = summary_data.get("dataset_context_profile", "")
+                        doc_summary = summary_data.get("summary", "")
+                        
+                        profile_md += f"#### **Dataset: {name}**\n"
+                        if context_profile: 
+                            profile_md += f"_{context_profile}_\n\n"
+                        elif doc_summary:
+                            profile_md += f"_{doc_summary}_\n\n"
+                        
+                        schema = summary_data.get("schema_classification", {})
+                        if schema:
+                            profile_md += "**Schema Classification:**\n"
+                            for role, cols in schema.items():
+                                if cols: 
+                                    profile_md += f"- **{role.replace('_', ' ').title()}**: {', '.join(cols)}\n"
+                                    
+                        detected_fields = summary_data.get("detected_fields", [])
+                        if detected_fields:
+                            profile_md += f"**Detected Fields:** {', '.join(detected_fields)}\n"
+                            
+                        profile_md += "\n---\n"
+
+                    add_message("system", profile_md)
+                    
+                    # 3. Make the orchestrator explicitly acknowledge the upload
+                    file_names_str = ", ".join([s.get("name") for s in all_sources])
+                    add_message("assistant", f"I have successfully received and scanned your file(s): **{file_names_str}**. Now you can ask questions or tell me what to analyze!")
+                    
+                    st.rerun()
+        # [FIX 1] Prevent infinite loop by checking if files were already processed
+        already_processed = {s.get("name") for s in st.session_state.sources}
+        new_files = [uf for uf in uploaded_files if uf.name not in already_processed]
+        
+        if new_files:
+            with st.spinner(f"Processing {len(new_files)} new file(s)..."):
+                saved = []
+                for uf in new_files:
+                    file_type, local_path, file_id = save_uploaded_file(uf)
+                    if file_type is not None:
+                        saved.append({"name": uf.name, "type": file_type, "path": local_path, "id": file_id})
+
+                if saved:
+                    for s in saved:
+                        register_file(s["id"], s["name"], s["path"], source="upload")
+
+                    def _extract_one(item):
+                        return {**item, "result": extract_metadata(item["type"], item["path"])}
+
+                    with ThreadPoolExecutor(max_workers=min(len(saved), 4)) as executor:
+                        processed = list(executor.map(_extract_one, saved))
+
+                    all_columns, all_sources = [], []
+                    built_registry = st.session_state.file_registry
+
+                    for item in processed:
+                        result = item["result"]
+                        cols = result.get("columns", [])
+                        all_columns.extend(cols)
+                        all_sources.append({
+                            "source_id": item["id"], "name": item["name"],
+                            "type": item["type"], "path": item["path"],
+                            "column_count": len(cols), "columns": cols,
+                            "data_summary": result.get("data_summary", {}),
+                            "edge_cases": result.get("edge_cases", {}),
+                        })
+                        stem = os.path.splitext(item["name"])[0].lower().replace(" ", "_")
+                        alias = stem
+                        counter = 2
+                        while alias in built_registry:
+                            alias = f"{stem}_{counter}"
+                            counter += 1
+                        built_registry[alias] = item["path"]
+
+                    st.session_state.metadata.extend(all_columns)
+                    st.session_state.sources.extend(all_sources)
+                    st.session_state.file_registry = built_registry
+                    st.session_state.uploaded = True
+                    st.session_state.stage = "AGENT_CHAT"
+                    
+                    # [FIX 2] Generate the Dataset Profile and inject it directly into the chat!
+                    profile_md = f"### 📊 Dataset Profiles Generated ({len(all_sources)} files)\n\n"
+                    for src in all_sources:
+                        name = src.get("name", "Unknown")
+                        summary_data = src.get("data_summary", {})
+                        
+                        context_profile = summary_data.get("dataset_context_profile", "")
+                        doc_summary = summary_data.get("summary", "")
+                        
+                        profile_md += f"#### **Dataset: {name}**\n"
+                        if context_profile: 
+                            profile_md += f"_{context_profile}_\n\n"
+                        elif doc_summary:
+                            profile_md += f"_{doc_summary}_\n\n"
+                        
+                        schema = summary_data.get("schema_classification", {})
+                        if schema:
+                            profile_md += "**Schema Classification:**\n"
+                            for role, cols in schema.items():
+                                if cols: 
+                                    profile_md += f"- **{role.replace('_', ' ').title()}**: {', '.join(cols)}\n"
+                                    
+                        detected_fields = summary_data.get("detected_fields", [])
+                        if detected_fields:
+                            profile_md += f"**Detected Fields:** {', '.join(detected_fields)}\n"
+                            
+                        profile_md += "\n---\n"
+
+                    add_message("system", profile_md)
+                    
+                    # Add hidden system event so chat doesn't look completely empty if starting fresh
+                    add_message("user", "[SYSTEM EVENT] The above datasets were injected into context.")
+                    st.rerun()
         with st.spinner(f"Processing {len(uploaded_files)} file(s)..."):
             saved = []
             for uf in uploaded_files:
@@ -308,18 +555,22 @@ def _render_result_data(result_data):
 # MAIN AREA: AGENTIC CHAT LOOP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MAIN AREA: AGENTIC CHAT LOOP
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 if st.session_state.stage == "AGENT_CHAT":
     
-    # 1. Welcome Screen if Empty
+    # Welcome Screen if Empty (No messages yet)
     if not st.session_state.messages:
         st.markdown("## Auditify Command Center")
         st.markdown("Upload data from the sidebar or just tell me what you want to analyze. I will plan, code, and execute the audit steps automatically.")
         st.divider()
 
-    # 2. Render History
+    # Render History
     render_messages()
 
-    # 3. Chat Input & Processing Loop
+    # Chat Input is ALWAYS visible
     if prompt := st.chat_input("Ask about your audit or give me a command..."):
         
         # Add and display User Message
@@ -336,6 +587,8 @@ if st.session_state.stage == "AGENT_CHAT":
             "messages": st.session_state.messages[-10:] # Context window
         }
 
+        # ... (Rest of your agentic logic remains exactly the same) ...
+
         # The 'Thinking' Phase
         with st.spinner("Agent is analyzing..."):
             agent_response = handle_agentic_turn(prompt, st.session_state.context)
@@ -348,10 +601,12 @@ if st.session_state.stage == "AGENT_CHAT":
 
         # Render Agent's Response
         with st.chat_message("assistant", avatar="🕵️"):
-            # Show "10 Steps Ahead" Reasoning
+            
+            # Show "Real-time Logs" Reasoning
             if thought:
-                with st.status("Agent Reasoning...", expanded=False):
-                    st.write(thought)
+                with st.status("⚙️ Processing Request...", expanded=True) as status:
+                    st.markdown(f"```text\n{thought}\n```")
+                    status.update(label="Analysis Complete", state="complete", expanded=False)
             
             # Action: Speak to User
             if action == "ask_user":
