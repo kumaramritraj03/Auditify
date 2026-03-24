@@ -161,7 +161,114 @@ def handle_query_v2(context: dict):
 
     return result
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AGENTIC CHAT ORCHESTRATOR (NEW)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+AGENTIC_PROMPT = """
+You are Auditify Command, a high-precision, proactive AI Audit Agent.
+Your mission is to assist the user in navigating complex datasets (CSV, Excel, JSON, PDF) 
+with the technical depth of a data engineer and the scrutiny of a financial auditor.
+
+You operate in a continuous Think -> Plan -> Act loop.
+
+### 1. Task Management & Todo System
+You maintain a persistent, dynamic Todo List.
+- Break complex queries into granular steps (e.g., Load -> Clean -> Join -> Analyze).
+- Update statuses dynamically: "pending", "in_progress", "completed".
+- If new files are uploaded, proactively add a "Scan new file" task.
+
+### 2. Forensic Execution & Code Strategy
+You generate Python code as an ephemeral tool to get answers.
+- ALWAYS use `file_registry["alias"]` to access files. NEVER hardcode local paths.
+  (Example: `df = duckdb.execute(f"SELECT * FROM read_csv_auto('{file_registry['my_file']}')").fetchdf()`)
+- Use `duckdb` for large-scale joins and aggregations.
+- The code MUST assign its final output to a variable named `result` (must be a Pandas DataFrame, list of dicts, or scalar).
+- DO NOT wrap the code in markdown formatting inside the JSON payload string.
+
+### 3. Output Format (STRICT JSON)
+You MUST return ONLY a valid JSON object matching this exact schema:
+
+{
+  "thought": "Internal reasoning about the user's intent, the data, and what to do next.",
+  "todo_list": [
+    {"task": "Load vendor list", "status": "completed"},
+    {"task": "Identify duplicate Tax IDs", "status": "in_progress"}
+  ],
+  "action": "execute_code" OR "ask_user",
+  "payload": "The actual Python code (if execute_code) OR your conversational reply (if ask_user)."
+}
+"""
+
+def handle_agentic_turn(user_query: str, context: dict) -> dict:
+    print(f"\n{'='*60}")
+    print(f"[AGENT LOOP] ========== handle_agentic_turn ==========")
+    print(f"[AGENT LOOP] User Query: {user_query[:100]}")
+
+    todo_str = json.dumps(context.get("todo_list", []), indent=2)
+    files_str = json.dumps(list(context.get("file_registry", {}).keys()))
+
+    recent_msgs = context.get("messages", [])[-5:]
+    history_str = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in recent_msgs])
+
+    prompt = f"""{AGENTIC_PROMPT}
+
+--- CURRENT CONTEXT ---
+REGISTERED FILES: {files_str}
+CURRENT TODO LIST:
+{todo_str}
+
+--- RECENT CHAT HISTORY ---
+{history_str}
+
+--- NEW USER INPUT ---
+USER: {user_query}
+
+Respond ONLY with valid JSON.
+"""
+
+    try:
+        response_text = call_llm(prompt, caller="agentic_orchestrator")
+
+        if not response_text:
+            raise ValueError("Empty response from LLM")
+
+        # 🔥 CLEAN RESPONSE
+        response_text = response_text.strip()
+
+        import re
+        if "```" in response_text:
+            match = re.search(r'```(?:json)?\s*\n(.*?)\n```', response_text, re.DOTALL)
+            if match:
+                response_text = match.group(1).strip()
+
+        print("[DEBUG] CLEANED LLM RESPONSE:")
+        print(response_text)
+
+        parsed = _parse_llm_json(response_text)
+
+        if not parsed or "action" not in parsed:
+            return {
+                "thought": "Failed JSON formatting",
+                "todo_list": context.get("todo_list", []),
+                "action": "ask_user",
+                "payload": f"Formatting error. Raw output:\n{response_text[:200]}"
+            }
+
+        print(f"[AGENT LOOP] LLM Action decided: {parsed['action']}")
+        print(f"{'='*60}\n")
+        return parsed
+
+    except Exception as e:
+        logger.error(f"Agentic loop error: {e}")
+        return {
+            "thought": f"System error: {str(e)}",
+            "todo_list": context.get("todo_list", []),
+            "action": "ask_user",
+            "payload": f"Internal error: {str(e)}"
+        }
+    
+    
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LLM DECISION LAYER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -219,39 +326,35 @@ def _get_llm_decision(context: dict) -> dict | None:
 
 def _parse_llm_json(response: str) -> dict | None:
     """Parse LLM response as strict JSON. Returns None on any failure."""
+    import re
+
     text = response.strip()
+
+    # Remove markdown wrappers
+    if "```" in text:
+        match = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
 
     # Direct parse
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, dict) and "next_tool" in parsed:
+        if isinstance(parsed, dict) and ("next_tool" in parsed or "action" in parsed):
             return parsed
     except json.JSONDecodeError:
         pass
 
-    # Try extracting from markdown code block
-    import re
-    match = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group(1))
-            if isinstance(parsed, dict) and "next_tool" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    # Try finding a JSON object
+    # Try extracting JSON object
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
             parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict) and "next_tool" in parsed:
+            if isinstance(parsed, dict) and ("next_tool" in parsed or "action" in parsed):
                 return parsed
         except json.JSONDecodeError:
             pass
 
     return None
-
 
 def _summarize_metadata(metadata: list) -> str:
     """Compact metadata representation to avoid bloating the LLM prompt."""
@@ -436,7 +539,7 @@ def _execute_tool(next_tool: str, context: dict) -> dict:
         if classification == "informational":
              return {
                 "stage": "INFORMATIONAL",
-                "data": _answer_informational(user_query, metadata, data_summary), # <-- Add data_summary here
+                "data": _answer_informational(user_query, metadata, data_summary, file_registry), # <-- Add data_summary here
                 "message": "Here is the information you requested."
             }
         questions = generate_clarifications(
