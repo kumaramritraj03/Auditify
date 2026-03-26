@@ -3,6 +3,7 @@ from typing import List
 from concurrent.futures import ThreadPoolExecutor
 from models import WorkflowSaveRequest, WorkflowRunRequest
 from orchestrator import handle_agentic_turn as handle_query_v2
+from audit_state import normalize_audit_state
 from workflow import save_workflow, fetch_workflows, get_workflow
 from execution import execute_code
 from agents import extract_workflow_semantics, map_fields
@@ -249,31 +250,8 @@ def orchestrate_step(context: dict):
     """
     try:
         # Extract query — support both key names
-        query = context.get("query") or context.get("user_query") or ""
-
-        # Normalise clarification_state from old flat keys if not already present
-        if "clarification_state" not in context:
-            context["clarification_state"] = {
-                "answers": context.get("clarifications", {}),
-                "attempt_count": context.get("clarification_attempt_count", 0),
-                "questions": context.get("previous_clarification_questions", []),
-            }
-
-        # Normalise file_registry from legacy file_path if not already present
-        if "file_registry" not in context and context.get("file_path"):
-            context["file_registry"] = {"default": context["file_path"]}
-
-        # Normalise sources list from legacy metadata if not already present
-        if "sources" not in context and context.get("metadata"):
-            context["sources"] = [{
-                "name": "uploaded_file",
-                "columns": context["metadata"],
-                "source_type": context.get("type", "csv"),
-                "data_summary": {},
-                "edge_cases": {},
-            }]
-
-        return handle_query_v2(query=query, context=context)
+        state = normalize_audit_state(context)
+        return handle_query_v2(query=state["query"], context=state)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

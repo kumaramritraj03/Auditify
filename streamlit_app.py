@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from metadata import extract_structured_metadata, process_pdf_file, preextract_pdf_structured
 from execution import execute_code_repl
 from agents import summarize_execution_result, extract_workflow_semantics, adapt_workflow_code, generate_workflow_insights, stream_intent_plan, validate_data_readiness, generate_clarifications
+from audit_state import build_audit_state, normalize_audit_state
 from file_registry import register_file, get_all_files
 from workflow import save_workflow, fetch_workflows, get_workflow, delete_workflow
 
@@ -23,9 +24,11 @@ try:
 except ImportError:
     def handle_agentic_turn(query, context, on_progress=None):  # noqa: ARG001
         _ = on_progress  # unused in fallback stub
-        return {"thought": "> Orchestrator missing.", "action": "ask_user",
-                "payload": "Fix orchestrator.py", "final_code": None,
-                "final_data": None, "plan": []}
+        state = build_audit_state(query=query)
+        state["response"]["thought"] = "> Orchestrator missing."
+        state["response"]["action"] = "ask_user"
+        state["response"]["message"] = "Fix orchestrator.py"
+        return state
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _UPLOAD_DIR = os.path.join(_BASE_DIR, "uploads")
@@ -704,15 +707,20 @@ def _render_pipeline(query: str, context: dict):
         _todo_items[step] = {"status": status, "detail": detail}
         _render_todo()
 
-    agent_response = handle_agentic_turn(query, context, on_progress=_on_progress)
+    agent_state = normalize_audit_state(handle_agentic_turn(query, context, on_progress=_on_progress), query=query)
 
     _render_todo()
 
-    payload    = agent_response.get("payload", "")
-    thought    = agent_response.get("thought", "")
-    final_code = agent_response.get("final_code")
-    final_data = agent_response.get("final_data")
-    new_clars  = agent_response.get("clarifications", [])
+    response = agent_state.get("response", {})
+    execution = agent_state.get("execution", {})
+    intent = agent_state.get("intent", {})
+    clarification = agent_state.get("clarification", {})
+
+    payload = response.get("message", "")
+    thought = response.get("thought", "")
+    final_code = execution.get("code")
+    final_data = execution.get("result")
+    new_clars = clarification.get("questions", [])
 
     if new_clars:
         st.session_state.pending_clarifications       = new_clars
@@ -751,9 +759,9 @@ def _render_pipeline(query: str, context: dict):
         st.session_state.pending_workflow = {
             "code":  final_code,
             "query": query,
-            "plan":  agent_response.get("plan", []),
-            "recommendation": agent_response.get("recommendation", "save"),
-            "reason": agent_response.get("reason", "")
+            "plan":  intent.get("plan", []),
+            "recommendation": response.get("recommendation", "save"),
+            "reason": response.get("reason", "")
         }
         add_message("assistant", "Data Result", msg_type="result", data={"result": final_data})
         with st.expander("View Data Result", expanded=True):
@@ -1481,14 +1489,15 @@ if st.session_state.intent_validation_state:
             st.session_state.intent_validation_state = None
             add_message("user", "🚀 All clarifications answered and data verified — generating analysis.")
 
-            run_context = {
-                "metadata":             st.session_state.metadata,
-                "sources":              active_sources,
-                "file_registry":        active_registry,
-                "conversation_history": st.session_state.messages,
-                "intent_plan":          enriched_plan,
-                "intent_confirmed":     True,
-            }
+            run_context = build_audit_state(
+                query=v_query,
+                metadata=st.session_state.metadata,
+                sources=active_sources,
+                file_registry=active_registry,
+                conversation_history=st.session_state.messages,
+                intent_plan=enriched_plan,
+                intent_confirmed=True,
+            )
             with st.chat_message("assistant", avatar="🕵️"):
                 _render_pipeline(v_query, run_context)
             st.rerun()
@@ -1520,17 +1529,16 @@ if st.session_state.pending_clarifications:
             original_query = st.session_state.clarification_original_query
             add_message("user", f"[Submitted clarification answers for: _{original_query[:60]}_]")
 
-            clar_context = {
-                "metadata":             st.session_state.metadata,
-                "sources":              st.session_state.sources,
-                "file_registry":        st.session_state.file_registry,
-                "conversation_history": st.session_state.messages,
-                "clarification_state":  {
-                    "answers":       answers,
-                    "attempt_count": st.session_state.clarification_attempt_count,
-                    "questions":     questions,
-                },
-            }
+            clar_context = build_audit_state(
+                query=original_query,
+                metadata=st.session_state.metadata,
+                sources=st.session_state.sources,
+                file_registry=st.session_state.file_registry,
+                conversation_history=st.session_state.messages,
+                clarification_answers=answers,
+                clarification_questions=questions,
+                clarification_attempt_count=st.session_state.clarification_attempt_count,
+            )
 
             st.session_state.pending_clarifications = []
 
@@ -1628,12 +1636,13 @@ if prompt := st.chat_input(_input_placeholder, disabled=_input_disabled):
         st.rerun()
     else:
         # Direct path: generic / informational queries
-        context = {
-            "metadata":             st.session_state.metadata,
-            "sources":              st.session_state.sources,
-            "file_registry":        st.session_state.file_registry,
-            "conversation_history": st.session_state.messages,
-        }
+        context = build_audit_state(
+            query=prompt,
+            metadata=st.session_state.metadata,
+            sources=st.session_state.sources,
+            file_registry=st.session_state.file_registry,
+            conversation_history=st.session_state.messages,
+        )
         with st.chat_message("assistant", avatar="🕵️"):
             _render_pipeline(prompt, context)
         st.rerun()
