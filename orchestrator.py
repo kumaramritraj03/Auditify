@@ -20,7 +20,7 @@ import logging
 import re
 
 from agents import (
-    classify_query,
+    call_orchestrator,
     answer_generic_query,
     answer_informational_query,
     generate_clarifications,
@@ -102,10 +102,30 @@ def handle_agentic_turn(query: str, context: dict, on_progress=None) -> dict:
     if user_wants_no_code:
         _log("> User explicitly requested no code — forcing informational path.")
 
-    # ── 1. Classify query — the brain's first decision ─────────────────────────
+    # ── 1. Route via Orchestrator Brain ────────────────────────────────────────
     _progress("Classifying query intent")
-    _log("> Calling Agent: classify_query (3-way)...")
-    classification = classify_query(query, metadata, has_data=has_data)
+    _log("> Calling Orchestrator Brain (FSM routing decision)...")
+    extracted_summary = sources[0].get("data_summary", {}) if sources else {}
+
+    orch = call_orchestrator(
+        query=query,
+        metadata=metadata,
+        conversation_history=conversation_history,
+        clarification_state=clar_state,
+        data_summary=extracted_summary,
+    )
+    next_tool = orch.get("next_tool", "analytical")
+    reasoning = orch.get("reasoning", "")
+    _log(f"> Orchestrator: next_tool={next_tool} | {reasoning}")
+
+    # Map FSM decision → 3-way classification
+    if next_tool == "informational":
+        classification = "informational" if has_data else "generic"
+    elif next_tool == "generic":
+        classification = "generic"
+    else:
+        classification = "analytical"
+
     # Override analytical → informational when user explicitly forbids code
     if user_wants_no_code and classification == "analytical":
         classification = "informational"
@@ -176,7 +196,15 @@ def handle_agentic_turn(query: str, context: dict, on_progress=None) -> dict:
     # Full analytical pipeline
     try:
         # ── Step A: Clarification check ────────────────────────────────────────
-        if clar_answers:
+        # Intent plan confirmation bypasses clarification entirely
+        intent_plan    = context.get("intent_plan", "")
+        intent_confirmed = context.get("intent_confirmed", False)
+
+        if intent_confirmed and intent_plan:
+            _log("> Intent plan confirmed by user — skipping clarification step.")
+            clarifications_str = f"CONFIRMED INTENT PLAN (user approved this approach):\n{intent_plan}"
+            _progress("Intent plan confirmed", "complete")
+        elif clar_answers:
             # User has already submitted answers via the clarification form — skip re-asking.
             _log(f"> Clarification answers received ({len(clar_answers)} answers) — skipping Step A.")
             clarifications_str = "\n".join(
@@ -236,6 +264,7 @@ def handle_agentic_turn(query: str, context: dict, on_progress=None) -> dict:
             metadata,
             clarifications_str,
             file_registry,
+            sources=sources,
             per_file_columns=per_file_cols,
         )
         _log("> Technical instructions formulated.")
@@ -248,7 +277,9 @@ def handle_agentic_turn(query: str, context: dict, on_progress=None) -> dict:
         _progress("Synthesising Python code")
         _log("> Calling Agent: generate_code...")
         raw_code = generate_code(instructions, metadata, file_registry,
-                                 per_file_columns=per_file_cols)
+                                 sources=sources,
+                                 per_file_columns=per_file_cols,
+                                 clarification_answers=clarifications_str)
         _log(f"> Code synthesised ({len(raw_code)} chars).")
         _progress("Synthesising Python code", "complete")
 
@@ -292,6 +323,8 @@ def handle_agentic_turn(query: str, context: dict, on_progress=None) -> dict:
             result["final_code"] = raw_code
             result["final_data"] = final_data
             result["plan"]       = plan_steps
+            result["recommendation"] = summary_json.get("recommendation", "save")
+            result["reason"] = summary_json.get("reason", "")
             return result
 
         else:
@@ -334,6 +367,8 @@ def handle_agentic_turn(query: str, context: dict, on_progress=None) -> dict:
                 result["final_code"] = fixed_raw
                 result["final_data"] = final_data
                 result["plan"]       = plan_steps
+                result["recommendation"] = summary_json.get("recommendation", "save")
+                result["reason"] = summary_json.get("reason", "")
                 return result
 
             else:

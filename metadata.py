@@ -679,44 +679,44 @@ def _build_result_from_df(df: pd.DataFrame, source_type: str) -> dict:
 # Standardized to return the same top-level schema as structured data:
 # { "columns": [...], "data_summary": {...}, "source_type": ..., "edge_cases": {...} }
 
-def _get_pdf_sample_images(pdf_path: str, max_pages: int = 5) -> list:
-    """Extract sample pages from PDF as Gemini Image Parts.
-
-    Samples 5-6 random pages (deterministic via file hash seed for reproducibility).
-    """
+def _get_sample_page_numbers(pdf_path: str, max_pages: int = 5) -> list:
+    """Determine the pages to extract. Takes all if <= 5, otherwise a deterministic sample of 5."""
+    import random
+    import hashlib
     try:
-        import random
-        import hashlib
-
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
+        doc.close()
+
         if total_pages == 0:
             return []
 
-        # Create deterministic seed from PDF file hash for reproducibility
-        # Same PDF always gets same random sample
+        if total_pages <= max_pages:
+            return list(range(total_pages))
+
         with open(pdf_path, 'rb') as f:
             pdf_hash = hashlib.md5(f.read()).hexdigest()
             seed = int(pdf_hash, 16) % (2**31)
 
         random.seed(seed)
+        return sorted(random.sample(range(total_pages), max_pages))
+    except Exception as e:
+        print(f"[PDF] Error getting sample pages: {e}")
+        return []
 
-        # Randomly sample 5-6 pages from the PDF
-        num_samples = min(max_pages, total_pages)
-        sample_pages = sorted(random.sample(range(total_pages), num_samples))
 
+def _get_pdf_sample_images(pdf_path: str, sample_pages: list) -> list:
+    """Extract selected sample pages from PDF as Gemini Image Parts."""
+    try:
+        doc = fitz.open(pdf_path)
         parts = []
         for idx in sample_pages:
             page = doc.load_page(idx)
-            # Render to png, dpi 140
             zoom = 140 / 72.0
             matrix = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             png_bytes = pix.tobytes("png")
-
-            # Convert to Vertex AI Part object
             parts.append(Part.from_data(data=png_bytes, mime_type="image/png"))
-
         doc.close()
         return parts
     except Exception as e:
@@ -724,41 +724,69 @@ def _get_pdf_sample_images(pdf_path: str, max_pages: int = 5) -> list:
         return []
 
 
-def _extract_tables_task(path: str) -> list:
-    """Worker task: Extracts tables using pdfplumber."""
+def _extract_tables_task(path: str, sample_pages: list) -> list:
+    """Worker task: Extracts tables using pdfplumber on selected pages."""
     table_dfs = []
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                for table in page.extract_tables():
-                    if not table or len(table) < 2:
-                        continue
-                    header = [re.sub(r'\s+', '_', str(h).strip().lower()) if h else f"col_{i}" for i, h in enumerate(table[0])]
-                    try:
-                        tdf = pd.DataFrame(table[1:], columns=header)
-                        tdf.dropna(how="all", inplace=True)
-                        tdf = tdf[tdf.apply(lambda r: r.astype(str).str.strip().ne("").any(), axis=1)]
-                        if not tdf.empty:
-                            table_dfs.append(tdf)
-                    except Exception:
-                        continue
+            for idx in sample_pages:
+                if idx < len(pdf.pages):
+                    page = pdf.pages[idx]
+                    for table in page.extract_tables():
+                        if not table or len(table) < 2:
+                            continue
+                        header = [re.sub(r'\s+', '_', str(h).strip().lower()) if h else f"col_{i}" for i, h in enumerate(table[0])]
+                        try:
+                            tdf = pd.DataFrame(table[1:], columns=header)
+                            tdf.dropna(how="all", inplace=True)
+                            tdf = tdf[tdf.apply(lambda r: r.astype(str).str.strip().ne("").any(), axis=1)]
+                            if not tdf.empty:
+                                table_dfs.append(tdf)
+                        except Exception:
+                            continue
     except Exception as e:
         print(f"[PDF] Table extraction error: {e}")
     return table_dfs
 
 
-def _vision_summary_task(path: str) -> dict:
-    """Worker task: Samples pages and calls Gemini Vision LLM."""
-    print("[PDF] Generating document summary via Vision...")
-    image_parts = _get_pdf_sample_images(path)
-    if image_parts:
-        return infer_document_metadata_vision(image_parts)
+def _vision_summary_task(path: str, sample_pages: list) -> dict:
+    """Worker task: Combines pymupdf4llm text and Gemini Vision on selected pages."""
+    print(f"[PDF] Generating document summary via Vision & pymupdf4llm (Pages: {sample_pages})...")
+
+    image_parts = _get_pdf_sample_images(path, sample_pages)
+
+    markdown_text = ""
+    try:
+        import pymupdf4llm
+        markdown_text = pymupdf4llm.to_markdown(path, pages=sample_pages)
+    except ImportError:
+        print("[PDF] pymupdf4llm not installed. Skipping markdown extraction.")
+    except Exception as e:
+        print(f"[PDF] pymupdf4llm extraction error: {e}. Falling back to fitz text extraction.")
+        try:
+            doc = fitz.open(path)
+            parts = []
+            for idx in sample_pages:
+                if idx < len(doc):
+                    parts.append(doc.load_page(idx).get_text("text"))
+            doc.close()
+            markdown_text = "\n\n".join(parts)
+        except Exception as fe:
+            print(f"[PDF] fitz fallback extraction error: {fe}")
+
+    contents = []
+    if markdown_text:
+        contents.append(f"--- EXTRACTED TEXT (Pages {sample_pages}) ---\n{markdown_text}\n--- END TEXT ---")
+    contents.extend(image_parts)
+
+    if contents:
+        return infer_document_metadata_vision(contents)
     return {}
 
 
 def process_pdf_file(path: str) -> dict:
-    """Hybrid PDF ingestion: Concurrent Table Extraction + Vision Understanding & Schema Merging."""
+    """Hybrid PDF ingestion: Concurrent Table Extraction + Vision & Markdown Understanding."""
     edge_cases = {
         "is_empty": False,
         "read_error": False,
@@ -766,21 +794,20 @@ def process_pdf_file(path: str) -> dict:
         "ocr_confidence": None,
     }
 
-    try:
-        import pdfplumber
-    except ImportError:
-        edge_cases["read_error"] = True
+    # Centralize sampling: Both tasks will use these exact same pages
+    sample_pages = _get_sample_page_numbers(path, max_pages=5)
+
+    if not sample_pages:
+        edge_cases["is_empty"] = True
         return {"columns": [], "data_summary": {}, "source_type": "pdf",
                 "column_count": 0, "sample_row_count": 0, "edge_cases": edge_cases}
 
     # ── 1. RUN CONCURRENTLY: Table Extraction & Vision API Call ──
     print(f"[PDF] Starting concurrent extraction for {os.path.basename(path)}")
     with ThreadPoolExecutor(max_workers=2) as executor:
-        # Submit both tasks to run at the exact same time
-        future_tables = executor.submit(_extract_tables_task, path)
-        future_vision = executor.submit(_vision_summary_task, path)
+        future_tables = executor.submit(_extract_tables_task, path, sample_pages)
+        future_vision = executor.submit(_vision_summary_task, path, sample_pages)
 
-        # Wait for both to finish and get their results
         table_dfs = future_tables.result()
         doc_summary = future_vision.result()
 
@@ -954,6 +981,175 @@ def process_sql_source(connection_config: dict) -> dict:
         "edge_cases": edge_cases,
         "tables": tables_metadata,
     }
+
+
+
+def preextract_pdf_structured(pdf_path: str, output_dir: str):
+    """Extract ALL pages from a PDF into a single analysis-ready DataFrame.
+
+    Each row = one table row from a page, enriched with that page's header/footer KV fields.
+    Pages with no table contribute one summary row (KV fields only, table cols blank).
+
+    Columns in the output (in order):
+      - page          : page number (1-indexed) — links every row back to its source page
+      - [kv_fields]   : Key-Value fields discovered in page text (e.g. invoice_number,
+                        vendor, date, subtotal, gst_18_percent, total).
+                        Normalised to snake_case. All accessible as df["col"].
+      - [table_cols]  : Table column names from pdfplumber (e.g. Item, Qty, Unit Price, Total).
+                        Union of all column names seen across all pages.
+
+    Key benefit: header fields (invoice_number, vendor, subtotal, GST, total) are REAL
+    DataFrame columns, not locked in raw text. Code can do df["invoice_number"] directly.
+
+    Returns:
+        (csv_path: str, df: pd.DataFrame)  on success
+        (None, None)                        if nothing could be extracted
+    """
+    import pdfplumber
+
+    page_records = []     # list of (page_num, kv_dict, table_rows_list)
+    all_kv_keys: list = []   # ordered union — first seen wins order
+    kv_key_set: set = set()
+    all_table_cols: list = []  # ordered union of table column names
+    table_col_set: set = set()
+
+    # ── Process every page ──────────────────────────────────────────────────
+    try:
+        # Open fitz once for the fallback text extraction across all pages
+        _fitz_doc = None
+        try:
+            _fitz_doc = fitz.open(pdf_path)
+        except Exception:
+            pass
+
+        with pdfplumber.open(pdf_path) as pdf:
+            n_pages = len(pdf.pages)
+            for page_idx, page in enumerate(pdf.pages):
+                page_num = page_idx + 1
+
+                # ── Text extraction (pdfplumber first, fitz fallback) ────────
+                raw_text = ""
+                try:
+                    raw_text = page.extract_text() or ""
+                except Exception:
+                    pass
+                if not raw_text.strip() and _fitz_doc is not None:
+                    try:
+                        raw_text = _fitz_doc.load_page(page_idx).get_text("text") or ""
+                    except Exception:
+                        pass
+
+                # ── Key-Value extraction from page text ──────────────────────
+                # Matches lines like:  "INVOICE #INV-2026-001"  (header line)
+                #                      "Vendor: ABC Traders Pvt Ltd"
+                #                      "GST (18%): 4244"
+                kv: dict = {}
+                for line in raw_text.splitlines():
+                    line = line.strip()
+                    m = re.match(
+                        r'^([A-Za-z][A-Za-z0-9 #\(\)\/\-_\.%]*?)\s*:\s*(.+)$', line
+                    )
+                    if m:
+                        raw_key = m.group(1).strip()
+                        val = m.group(2).strip()
+                        col = re.sub(r'[^a-zA-Z0-9]+', '_', raw_key).strip('_').lower()
+                        if col and val and len(col) <= 40:
+                            kv[col] = val
+                            if col not in kv_key_set:
+                                kv_key_set.add(col)
+                                all_kv_keys.append(col)
+
+                # ── Table extraction ─────────────────────────────────────────
+                table_rows: list = []
+                try:
+                    for raw_table in (page.extract_tables() or []):
+                        if not raw_table or len(raw_table) < 2:
+                            continue
+                        headers = [
+                            str(h).strip() if h else f"col_{i}"
+                            for i, h in enumerate(raw_table[0])
+                        ]
+                        for h in headers:
+                            if h not in table_col_set:
+                                table_col_set.add(h)
+                                all_table_cols.append(h)
+                        for raw_row in raw_table[1:]:
+                            row_dict = {
+                                headers[i]: (str(c).strip() if c is not None else "")
+                                for i, c in enumerate(raw_row)
+                                if i < len(headers)
+                            }
+                            if any(v for v in row_dict.values()):
+                                table_rows.append(row_dict)
+                except Exception as te:
+                    print(f"[PDF STRUCTURED] Table page {page_num}: {te}")
+
+                page_records.append((page_num, kv, table_rows))
+
+        if _fitz_doc is not None:
+            try:
+                _fitz_doc.close()
+            except Exception:
+                pass
+
+    except Exception as e:
+        if _fitz_doc is not None:
+            try:
+                _fitz_doc.close()
+            except Exception:
+                pass
+        print(f"[PDF STRUCTURED] Extraction failed: {e}")
+        return None, None
+
+    if not page_records:
+        print(f"[PDF STRUCTURED] No pages extracted from {pdf_path}")
+        return None, None
+
+    # ── Build merged rows ────────────────────────────────────────────────────
+    # Each table row gets the KV metadata from its page prepended.
+    # Pages with no table contribute one summary row with empty table cols.
+    final_rows = []
+    for page_num, kv, table_rows in page_records:
+        # Base row: page number + all KV fields (blank if not on this page)
+        base = {"page": page_num}
+        for k in all_kv_keys:
+            base[k] = kv.get(k, "")
+
+        if table_rows:
+            for trow in table_rows:
+                row = dict(base)
+                for c in all_table_cols:
+                    row[c] = trow.get(c, "")
+                final_rows.append(row)
+        else:
+            # Page with only header/footer text — add one summary row
+            row = dict(base)
+            for c in all_table_cols:
+                row[c] = ""
+            final_rows.append(row)
+
+    df = pd.DataFrame(final_rows)
+
+    # ── Column order: page → KV fields → table columns ───────────────────────
+    ordered_cols = ["page"] + all_kv_keys + all_table_cols
+    df = df[[c for c in ordered_cols if c in df.columns]]
+
+    # Drop table columns that are entirely empty (extraction artefacts)
+    non_empty_table_cols = [
+        c for c in all_table_cols
+        if c in df.columns and df[c].astype(str).str.strip().ne("").any()
+    ]
+    final_cols = ["page"] + all_kv_keys + non_empty_table_cols
+    df = df[[c for c in final_cols if c in df.columns]]
+
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    csv_path = os.path.join(output_dir, f"{base_name}_structured.csv")
+    df.to_csv(csv_path, index=False)
+    print(
+        f"[PDF STRUCTURED] {n_pages} pages → {len(df)} rows × {len(df.columns)} cols "
+        f"({len(all_kv_keys)} KV + {len(non_empty_table_cols)} table) → {csv_path}"
+    )
+    return csv_path, df
 
 
 def _sql_type_to_semantic(sql_type: str) -> str:

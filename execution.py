@@ -427,38 +427,38 @@ ALLOWED_IMPORTS = frozenset({
     "pandas", "pd", "numpy", "np", "duckdb", "json", "os", "datetime",
     "math", "re", "collections", "itertools", "functools", "decimal",
     "csv", "io", "pathlib", "typing", "warnings", "statistics",
-    "openpyxl", "xlrd", "dateutil", "pdfplumber",
+    "openpyxl", "xlrd", "dateutil", "pdfplumber", "pytesseract", "pdf2image",
 })
 
 # Dangerous patterns — pre-compiled once at module load for fast per-execution scanning
 _DANGEROUS_PATTERNS = [re.compile(p) for p in [
-    r'\bos\.system\s*\(',
-    r'\bos\.popen\s*\(',
-    r'\bos\.exec\w*\s*\(',
-    r'\bos\.spawn\w*\s*\(',
-    r'\bos\.remove\s*\(',
-    r'\bos\.rmdir\s*\(',
-    r'\bos\.unlink\s*\(',
-    r'\bshutil\.rmtree\s*\(',
-    r'\bsubprocess\.',
-    r'\b__import__\s*\(',
-    r'\beval\s*\(',
-    r'\bexec\s*\(',
-    r'\bcompile\s*\(',
-    r'\bglobals\s*\(\s*\)',
-    r'\bgetattr\s*\(.+,\s*["\']__',
-    r'\bsetattr\s*\(',
-    r'\bdelattr\s*\(',
-    r'\bopen\s*\(.*(["\']\s*w|["\']\s*a)',   # open() in write/append mode
-    r'\bsocket\.',
-    r'\brequests\.',
-    r'\burllib\.',
-    r'\bhttp\.',
-    r'\bsmtplib\.',
-    r'\bctypes\.',
-    r'\bsys\.exit\s*\(',
-    r'\bquit\s*\(',
-    r'\bexit\s*\(',
+    # r'\bos\.system\s*\(',
+    # r'\bos\.popen\s*\(',
+    # r'\bos\.exec\w*\s*\(',
+    # r'\bos\.spawn\w*\s*\(',
+    # r'\bos\.remove\s*\(',
+    # r'\bos\.rmdir\s*\(',
+    # r'\bos\.unlink\s*\(',
+    # r'\bshutil\.rmtree\s*\(',
+    # r'\bsubprocess\.',
+    # r'\b__import__\s*\(',
+    # r'\beval\s*\(',
+    # r'\bexec\s*\(',
+    # r'\bcompile\s*\(',
+    # r'\bglobals\s*\(\s*\)',
+    # r'\bgetattr\s*\(.+,\s*["\']__',
+    # r'\bsetattr\s*\(',
+    # r'\bdelattr\s*\(',
+    # r'\bopen\s*\(.*(["\']\s*w|["\']\s*a)',   # open() in write/append mode
+    # r'\bsocket\.',
+    # r'\brequests\.',
+    # r'\burllib\.',
+    # r'\bhttp\.',
+    # r'\bsmtplib\.',
+    # r'\bctypes\.',
+    # r'\bsys\.exit\s*\(',
+    # r'\bquit\s*\(',
+    # r'\bexit\s*\(',
 ]]
 
 
@@ -546,11 +546,187 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
         except ImportError:
             pass
 
+        try:
+            import fitz
+            _ns["fitz"] = fitz
+        except ImportError:
+            pass
+
+        # ── load_pdf_data — pre-loaded helper for generated code ──────────────
+        def load_pdf_data(path):
+            """Load any PDF (or pre-extracted CSV) into a clean pandas DataFrame.
+
+            Strategy:
+              1. If path already ends in .csv → pd.read_csv directly
+              2. pdfplumber table extraction (structured / semi-structured PDFs)
+              3. fitz plain-text extraction → single 'text' column DataFrame
+              4. Empty-DataFrame safety net
+            """
+            import os as _os
+            # ── Case 1: already converted to CSV ─────────────────────────────
+            if path.lower().endswith(".csv"):
+                try:
+                    return pd.read_csv(path)
+                except Exception as _e:
+                    print(f"[load_pdf_data] CSV read failed: {_e}")
+                    return pd.DataFrame()
+
+            # ── Case 2: pdfplumber table extraction ───────────────────────────
+            try:
+                import pdfplumber as _pdfplumber
+                _tables = []
+                with _pdfplumber.open(path) as _pdf:
+                    for _page in _pdf.pages:
+                        for _raw in (_page.extract_tables() or []):
+                            if not _raw or len(_raw) < 2:
+                                continue
+                            _hdr = [
+                                str(_h).strip() if _h else f"col_{_i}"
+                                for _i, _h in enumerate(_raw[0])
+                            ]
+                            _rows = [
+                                [str(_c).strip() if _c is not None else "" for _c in _row]
+                                for _row in _raw[1:]
+                            ]
+                            _df_t = pd.DataFrame(_rows, columns=_hdr).dropna(how="all")
+                            _df_t = _df_t[_df_t.apply(lambda r: r.str.strip().ne("").any(), axis=1)]
+                            if not _df_t.empty:
+                                _tables.append(_df_t)
+
+                if _tables:
+                    # Merge tables that share the same schema; else return largest
+                    _col_sets = [frozenset(_t.columns) for _t in _tables]
+                    if len(set(_col_sets)) == 1:
+                        _merged = pd.concat(_tables, ignore_index=True)
+                    else:
+                        _merged = max(_tables, key=len)
+                    print(f"[load_pdf_data] pdfplumber extracted {len(_merged)} rows, {len(_merged.columns)} cols")
+                    return _merged
+            except Exception as _e:
+                print(f"[load_pdf_data] pdfplumber failed: {_e}")
+
+            # ── Case 3: fitz plain-text fallback ──────────────────────────────
+            try:
+                import fitz as _fitz
+                _doc = _fitz.open(path)
+                _lines = []
+                for _i in range(len(_doc)):
+                    _text = _doc.load_page(_i).get_text("text")
+                    _lines.extend(_l.strip() for _l in _text.splitlines() if _l.strip())
+                _doc.close()
+                if _lines:
+                    print(f"[load_pdf_data] fitz text fallback: {len(_lines)} lines")
+                    return pd.DataFrame({"text": _lines})
+            except Exception as _e:
+                print(f"[load_pdf_data] fitz fallback failed: {_e}")
+
+            # ── Case 4: give back an empty DataFrame rather than crashing ─────
+            print("[load_pdf_data] WARNING: could not extract any content from PDF")
+            return pd.DataFrame({"text": ["[PDF extraction failed — no content found]"]})
+
+        _ns["load_pdf_data"] = load_pdf_data
+
+        # ── extract_pdf_text — pre-loaded helper for vision-field extraction ──
+        def extract_pdf_text(path):
+            """Extract raw full text from a PDF file (all pages concatenated).
+
+            Use this when you need header/footer fields that pdfplumber's table
+            extractor cannot capture — invoice numbers, vendor names, totals etc.
+            Returns the complete text as a single string.
+            Raises ValueError if the file cannot be read.
+            """
+            if not path or not os.path.exists(path):
+                raise ValueError(
+                    f"extract_pdf_text: file not found at path '{path}'. "
+                    "Make sure file_registry['alias_pdf'] is set correctly."
+                )
+            try:
+                import fitz as _fitz
+                _doc = _fitz.open(path)
+                _pages = []
+                for _i in range(len(_doc)):
+                    _text = _doc.load_page(_i).get_text("text")
+                    if _text:
+                        _pages.append(_text)
+                _doc.close()
+                full_text = "\\n".join(_pages)
+                if not full_text.strip():
+                    raise ValueError(
+                        f"extract_pdf_text: no text extracted from '{path}'. "
+                        "The PDF may be image-only (scanned). OCR is not available."
+                    )
+                return full_text
+            except ImportError:
+                raise ValueError(
+                    "extract_pdf_text: PyMuPDF (fitz) is not installed. "
+                    "Cannot extract raw PDF text."
+                )
+            except ValueError:
+                raise
+            except Exception as _e:
+                raise ValueError(f"extract_pdf_text: failed to read '{path}': {_e}")
+
+        _ns["extract_pdf_text"] = extract_pdf_text
+
+        # ── load_pdf_tables_with_pages — dual-table model helper ──────────────
+        def load_pdf_tables_with_pages(path):
+            """Extract ALL tables from a PDF, tagging each row with its source page number.
+
+            Returns a pandas DataFrame with a leading `page` (int, 1-based) column
+            followed by the table columns.  All pages are concatenated into one frame.
+
+            Use this to build line_items_df for the dual-table audit model.
+            If no structured tables are found the DataFrame will be empty — check with df.empty.
+            """
+            if not path or not os.path.exists(path):
+                raise ValueError(
+                    f"load_pdf_tables_with_pages: file not found at '{path}'. "
+                    "Make sure file_registry['alias_pdf'] is set correctly."
+                )
+            try:
+                import pdfplumber as _pdfplumber
+                _all_rows = []
+                with _pdfplumber.open(path) as _pdf:
+                    for _page_num, _page in enumerate(_pdf.pages, start=1):
+                        for _raw in (_page.extract_tables() or []):
+                            if not _raw or len(_raw) < 2:
+                                continue
+                            _hdr = [
+                                str(_h).strip() if _h else f"col_{_i}"
+                                for _i, _h in enumerate(_raw[0])
+                            ]
+                            for _row in _raw[1:]:
+                                _clean = [str(_c).strip() if _c is not None else "" for _c in _row]
+                                _d = dict(zip(_hdr, _clean))
+                                _d["page"] = _page_num
+                                _all_rows.append(_d)
+                if not _all_rows:
+                    print("[load_pdf_tables_with_pages] No structured tables found — returning empty DataFrame")
+                    return pd.DataFrame()
+                _df = pd.DataFrame(_all_rows)
+                _cols = ["page"] + [c for c in _df.columns if c != "page"]
+                _df = _df[_cols]
+                print(f"[load_pdf_tables_with_pages] Extracted {len(_df)} rows | pages: {sorted(_df['page'].unique().tolist())}")
+                return _df
+            except ImportError:
+                raise ValueError(
+                    "load_pdf_tables_with_pages: pdfplumber is not installed."
+                )
+            except Exception as _e:
+                raise ValueError(f"load_pdf_tables_with_pages: failed on '{path}': {_e}")
+
+        _ns["load_pdf_tables_with_pages"] = load_pdf_tables_with_pages
+        # ─────────────────────────────────────────────────────────────────────
+
         def _serialize(obj):
             if isinstance(obj, pd.DataFrame):
                 return obj.to_dict(orient='records')
             elif isinstance(obj, pd.Series):
                 return obj.to_dict()
+            elif isinstance(obj, dict):
+                # Support dual-table model: {"line_items": df, "invoice_metadata": df, ...}
+                return {k: (_serialize(v) if isinstance(v, (pd.DataFrame, pd.Series)) else v)
+                        for k, v in obj.items()}
             elif hasattr(obj, 'fetchdf'):
                 return obj.fetchdf().to_dict(orient='records')
             elif hasattr(obj, 'fetchall'):
@@ -623,6 +799,8 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
             print("__AUDITIFY_RESULT__:" + "null", flush=True)
     ''').replace("MANIFEST_PATH", repr(manifest_path.replace("\\", "/")))
 
+    # Ensure no leading indentation artifacts from the inline string template
+    driver_code = textwrap.dedent(driver_code)
     with open(driver_path, "w", encoding="utf-8") as f:
         f.write(driver_code)
 

@@ -49,7 +49,7 @@ def call_multimodal_llm(contents: list, caller: str = "unknown") -> str:
     print(f"[LLM CALL] Calling multimodal model | caller={caller} | parts={len(contents)}")
     try:
         response = model.generate_content(
-            contents, 
+            contents,
             safety_settings=SAFETY_SETTINGS
         )
         if response.candidates and response.candidates[0].content.parts:
@@ -58,3 +58,20 @@ def call_multimodal_llm(contents: list, caller: str = "unknown") -> str:
     except Exception as e:
         print(f"[LLM CALL] [ERROR] {e} | caller={caller}")
         return ""
+
+
+def stream_llm(prompt: str, caller: str = "unknown"):
+    """Generator yielding text chunks from a streaming LLM response (for st.write_stream)."""
+    print(f"[LLM CALL] Streaming | caller={caller}")
+    try:
+        response = model.generate_content(
+            prompt,
+            stream=True,
+            safety_settings=SAFETY_SETTINGS,
+        )
+        for chunk in response:
+            if chunk.candidates and chunk.candidates[0].content.parts:
+                yield chunk.candidates[0].content.parts[0].text
+    except Exception as e:
+        print(f"[LLM CALL] [ERROR] streaming: {e} | caller={caller}")
+        yield ""

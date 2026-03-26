@@ -4,6 +4,7 @@ import os
 from difflib import SequenceMatcher
 from vertex_client import call_llm, call_multimodal_llm
 from prompts import (
+    ORCHESTRATOR_PROMPT,
     CLARIFICATION_PROMPT,
     CLARIFICATION_VALIDATION_PROMPT,
     PLANNING_PROMPT,
@@ -22,6 +23,11 @@ from prompts import (
     INFORMATIONAL_QUERY_PROMPT,
     WORKFLOW_ADAPTATION_PROMPT,
     WORKFLOW_INSIGHTS_PROMPT,
+    INTENT_PLANNING_PROMPT,
+    DATA_READINESS_PROMPT,
+    INTENT_CLARIFICATION_PROMPT,
+    PDF_CODE_INSTRUCTION_PROMPT,
+    PDF_CODE_GENERATION_PROMPT,
 )
 def _parse_json(response: str, fallback=None):
     """Safely parse JSON from LLM response, handling markdown wrappers."""
@@ -74,7 +80,66 @@ def _build_history_str(conversation_history: list, max_turns: int = 8) -> str:
     return "\n".join(lines) or "No prior conversation."
 
 
-def classify_query(query: str, metadata: list, has_data: bool = False) -> str:
+def call_orchestrator(
+    query: str,
+    metadata: list,
+    conversation_history: list,
+    clarification_state: dict,
+    data_summary=None,
+) -> dict:
+    """Call ORCHESTRATOR_PROMPT to get the FSM routing decision.
+
+    Uses .replace() for template substitution — avoids escaping issues with
+    the JSON examples embedded inside ORCHESTRATOR_PROMPT.
+
+    Returns {"next_tool": str, "reasoning": str}.
+    Caller maps next_tool → "generic" | "informational" | "analytical".
+    """
+    print("[FUNCTION] Entering call_orchestrator")
+
+    col_names = [c.get("name", "") if isinstance(c, dict) else str(c) for c in (metadata or [])]
+    clar_answers  = clarification_state.get("answers") or {}
+    clar_attempt  = clarification_state.get("attempt_count", 0)
+
+    # Truncate data_summary to avoid bloating the prompt — the key fields fit in 2000 chars
+    summary_str  = json.dumps(data_summary, indent=2)[:2000] if data_summary else "Not available"
+    clar_str     = json.dumps(clar_answers) if clar_answers else "None"
+    history_str  = json.dumps((conversation_history or [])[-5:])
+
+    # Use .replace() per-placeholder — safe against JSON braces inside the prompt body
+    prompt = (
+        ORCHESTRATOR_PROMPT
+        .replace("current_stage: {current_stage}", "current_stage: START")
+        .replace("user_query: {user_query}", f"user_query: {query}")
+        .replace("conversation_history: {conversation_history}", f"conversation_history: {history_str}")
+        .replace("metadata: {metadata}", f"metadata: {col_names[:30]}")
+        .replace("dataset_summary: {data_summary}", f"dataset_summary: {summary_str}")
+        .replace("clarifications: {clarifications}", f"clarifications: {clar_str}")
+        .replace("plan: {plan}", "plan: ")
+        .replace("is_confirmed: {is_confirmed}", "is_confirmed: false")
+        .replace("code: {code}", "code: ")
+        .replace("result: {result}", "result: ")
+        .replace(
+            "clarification_attempt_count: {clarification_attempt_count}",
+            f"clarification_attempt_count: {clar_attempt}",
+        )
+        .replace("has_invalid_responses: {has_invalid_responses}", "has_invalid_responses: false")
+    )
+
+    print("[STAGE] ORCHESTRATOR | [LLM CALL] FSM routing decision")
+    response = call_llm(prompt, caller="call_orchestrator")
+    result   = _parse_json(response, fallback={"next_tool": "analytical", "reasoning": "fallback"})
+    if not isinstance(result, dict):
+        result = {"next_tool": "analytical", "reasoning": "parse failed"}
+
+    next_tool = result.get("next_tool", "analytical")
+    reasoning = result.get("reasoning", "")
+    print(f"[STAGE] ORCHESTRATOR | [FUNCTION] next_tool={next_tool} | reason={reasoning[:80]}")
+    print("[FUNCTION] Exiting call_orchestrator")
+    return result
+
+
+def classify_query(query: str, metadata: list, has_data: bool = False, data_summary=None) -> str:
     """Classify query as 'generic', 'informational', or 'analytical'.
 
     - generic:       Greetings, general knowledge, math, anything unrelated to loaded data.
@@ -83,9 +148,16 @@ def classify_query(query: str, metadata: list, has_data: bool = False) -> str:
     """
     print("[FUNCTION] Entering classify_query")
     col_names = [c.get("name", "") if isinstance(c, dict) else str(c) for c in (metadata or [])]
+    
+    # Format the data summary cleanly (capped to avoid blowing up the prompt size)
+    summary_str = "Not available"
+    if data_summary:
+        summary_str = json.dumps(data_summary, indent=2)[:2000]
+
     prompt = QUERY_CLASSIFICATION_PROMPT.format(
         query=query,
         has_data="Yes" if has_data else "No",
+        data_summary=summary_str,
         metadata=col_names[:30],  # send first 30 column names to keep prompt lean
     )
     print("[STAGE] CLASSIFICATION | [LLM CALL] Classifying query type (3-way)")
@@ -99,7 +171,6 @@ def classify_query(query: str, metadata: list, has_data: bool = False) -> str:
     print(f"[STAGE] CLASSIFICATION | [FUNCTION] Result: {classification}")
     print("[FUNCTION] Exiting classify_query")
     return classification
-
 
 def answer_generic_query(query: str, conversation_history: list, data_context: str = "") -> str:
     """Answer a generic/conversational query that does not require data analysis.
@@ -513,11 +584,46 @@ def generate_plan(query, metadata, clarifications):
     return result
 
 
+def _load_csv_sample(path: str, n_rows: int = 5) -> dict:
+    """Peek at a CSV file and return confirmed schema + sample rows.
+
+    Returns a dict with:
+        columns    – list of actual column names from the file header
+        row_count  – total number of rows in the file
+        page_count – number of unique values in the 'page' column (0 if absent)
+        sample     – list of n_rows dicts (first rows of the file)
+        error      – error message string if the file could not be read (else None)
+    """
+    result = {"columns": [], "row_count": 0, "page_count": 0, "sample": [], "error": None}
+    if not path or not os.path.exists(path):
+        result["error"] = f"File not found: {path}"
+        return result
+    if not path.lower().endswith(".csv"):
+        result["error"] = "Not a CSV file — sample not loaded."
+        return result
+    try:
+        import pandas as _pd
+        df = _pd.read_csv(path, nrows=n_rows + 1, dtype=str)  # read a few extra for count hint
+        full_df = _pd.read_csv(path, dtype=str)               # full read for row/page count
+        result["columns"] = list(full_df.columns)
+        result["row_count"] = len(full_df)
+        if "page" in full_df.columns:
+            result["page_count"] = full_df["page"].nunique()
+        result["sample"] = df.head(n_rows).fillna("").to_dict(orient="records")
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
 def _build_per_file_columns(sources: list, file_registry: dict) -> str:
     """Build a per-file column manifest string for code generation prompts.
 
     Critical for multi-file scenarios so the LLM knows exactly which column
     names exist in each file and doesn't hallucinate or mix them up.
+
+    Now also peeks at the actual CSV files on disk to inject a confirmed
+    data snapshot (real column names, row/page counts, sample rows) so the
+    LLM generating code works from ground truth, not inferred metadata.
     """
     if not sources:
         return "No per-file column breakdown available."
@@ -544,73 +650,219 @@ def _build_per_file_columns(sources: list, file_registry: dict) -> str:
                     break
 
         cols = src.get("columns", [])
-        col_entries = []
+        src_type = src.get("source_type", "")
+        actual_path = file_registry.get(matched_alias, "")
+
+        # Determine how the LLM should load this file at runtime
+        if src_type == "pdf" and actual_path.lower().endswith(".csv"):
+            load_hint = "PDF pre-extracted → CSV — load with: pd.read_csv(file_registry[\"alias\"])"
+        elif src_type == "pdf":
+            load_hint = "PDF — load with: load_pdf_data(file_registry[\"alias\"])  [pre-loaded, no import needed]"
+        else:
+            load_hint = ""
+
+        runtime_entries = []
+        vision_entries = []
         for col in cols:
             if isinstance(col, dict):
                 cname = col.get("name", "")
                 sem   = col.get("semantic_info", {})
                 ctype = sem.get("predicted_type", col.get("predicted_type", "unknown"))
+                col_source = col.get("column_source", "")
                 if cname:
-                    col_entries.append(f"    - {cname} ({ctype})")
+                    if col_source == "vision":
+                        vision_entries.append(f"      - {cname} ({ctype})")
+                    else:
+                        runtime_entries.append(f"      - {cname} ({ctype})")
             elif isinstance(col, str) and col:
-                col_entries.append(f"    - {col}")
+                runtime_entries.append(f"      - {col}")
 
-        if col_entries:
-            lines.append(f"  File: '{src_name}'  →  alias: \"{matched_alias}\"")
-            lines.extend(col_entries)
-            lines.append("")
+        col_entries = runtime_entries  # kept for empty-check below
+
+        if runtime_entries or vision_entries:
+            header = f"  File: '{src_name}'  →  alias: \"{matched_alias}\""
+            if load_hint:
+                header += f"  [{load_hint}]"
+            lines.append(header)
+            if runtime_entries:
+                lines.append("    RUNTIME CSV COLUMNS (real DataFrame columns — df['col'] works):")
+                lines.extend(runtime_entries)
+            if vision_entries:
+                lines.append("    ⚠️  VISION-DETECTED FIELDS (NOT in the CSV — df['col'] will KeyError):")
+                lines.append("        These are document-level fields detected by AI vision analysis.")
+                lines.append("        To use them: derive from runtime CSV columns (e.g. sum line items),")
+                lines.append("        or raise ValueError explaining they require manual extraction.")
+                lines.append("        NEVER add them as NULL default columns. NEVER access df['field_name'].")
+                lines.extend(vision_entries)
+        elif src_type == "pdf" and load_hint:
+            # PDF with no extracted columns still needs its load hint
+            lines.append(f"  File: '{src_name}'  →  alias: \"{matched_alias}\"  [{load_hint}]")
+            lines.append("    (no structured columns detected — treat as free text after loading)")
+
+        # ── CONFIRMED DATA SNAPSHOT from the actual file on disk ──────────────
+        # This is ground truth — the LLM must generate code against this exact
+        # schema and data, not against inferred or assumed column names.
+        if actual_path and actual_path.lower().endswith(".csv"):
+            snap = _load_csv_sample(actual_path, n_rows=5)
+            if snap["error"]:
+                lines.append(f"    ⚠️  DATA SNAPSHOT: could not read file — {snap['error']}")
+            else:
+                lines.append(f"    ✅ CONFIRMED DATA SNAPSHOT (ground truth — use ONLY these columns):")
+                lines.append(f"       Path:       {actual_path}")
+                lines.append(f"       Total rows: {snap['row_count']}")
+                if snap["page_count"]:
+                    lines.append(f"       Unique pages (invoice count): {snap['page_count']}")
+                lines.append(f"       Confirmed columns ({len(snap['columns'])}): {snap['columns']}")
+                if snap["sample"]:
+                    lines.append(f"       First {len(snap['sample'])} rows (sample — actual data values):")
+                    for i, row in enumerate(snap["sample"], 1):
+                        lines.append(f"         row {i}: {row}")
+                lines.append(
+                    "       RULE: Generate code that loads THIS file (via file_registry alias) "
+                    "and accesses ONLY the confirmed columns listed above."
+                )
+        lines.append("")
 
     return "\n".join(lines) if lines else "No per-file column breakdown available."
+
+
+def _has_pdf_vision_sources(sources: list) -> bool:
+    """Return True when at least one source is a PDF with vision-detected columns.
+
+    This is the trigger for routing to the PDF-specific code generation prompts
+    instead of the generic ones.  Vision-detected columns are those tagged with
+    column_source == 'vision' — meaning they were found by Gemini vision analysis
+    but are NOT present as runtime DataFrame columns in the extracted CSV.
+    """
+    if not sources:
+        return False
+    for src in sources:
+        if src.get("source_type") != "pdf":
+            continue
+        for col in src.get("columns", []):
+            if isinstance(col, dict) and col.get("column_source") == "vision":
+                return True
+    return False
+
+
+def _runtime_column_names(sources: list, metadata: list) -> list:
+    """Return only the runtime CSV column names (exclude vision-detected ones).
+
+    Used to give the PDF code generation prompt a clean flat list that only
+    contains columns the generated code can actually access as df["col"].
+    Falls back to the full metadata list for non-PDF sources.
+    """
+    runtime = []
+    pdf_aliases_seen = False
+    for src in (sources or []):
+        if src.get("source_type") == "pdf":
+            pdf_aliases_seen = True
+            for col in src.get("columns", []):
+                if isinstance(col, dict) and col.get("column_source") != "vision":
+                    name = col.get("name", "")
+                    if name:
+                        runtime.append(name)
+        else:
+            for col in src.get("columns", []):
+                name = (col.get("name", "") if isinstance(col, dict) else str(col)).strip()
+                if name:
+                    runtime.append(name)
+    # If no PDF sources, fall back to full metadata-derived list
+    if not pdf_aliases_seen:
+        runtime = _extract_column_names(metadata)
+    return runtime
 
 
 def generate_code_instructions(plan, metadata, clarifications, file_registry: dict,
                                sources: list = None, per_file_columns: str = None):
     """Generate high-level code instructions from the plan.
 
+    Routes to PDF_CODE_INSTRUCTION_PROMPT when the sources include PDFs with
+    vision-detected columns; otherwise uses the generic CODE_INSTRUCTION_PROMPT.
+
     file_registry: {alias -> absolute_path} for every available file.
     per_file_columns: pre-built column manifest (pass from orchestrator to avoid recomputing).
     """
     print("[FUNCTION] Entering generate_code_instructions")
-    column_names = _extract_column_names(metadata)
     if per_file_columns is None:
         per_file_columns = _build_per_file_columns(sources or [], file_registry)
-    prompt = CODE_INSTRUCTION_PROMPT.format(
-        plan=plan,
-        metadata=metadata,
-        column_names=column_names,
-        clarifications=clarifications,
-        file_registry=json.dumps(file_registry, indent=2),
-        per_file_columns=per_file_columns,
-    )
+
+    use_pdf_prompt = _has_pdf_vision_sources(sources or [])
+
+    if use_pdf_prompt:
+        print("[STAGE] CODEGEN | PDF vision sources detected — using PDF_CODE_INSTRUCTION_PROMPT")
+        column_names = _runtime_column_names(sources or [], metadata)
+        prompt = PDF_CODE_INSTRUCTION_PROMPT.format(
+            plan=plan,
+            per_file_columns=per_file_columns,
+            column_names=column_names,
+            clarifications=clarifications,
+            file_registry=json.dumps(file_registry, indent=2),
+        )
+        caller = "generate_code_instructions[pdf]"
+    else:
+        column_names = _extract_column_names(metadata)
+        prompt = CODE_INSTRUCTION_PROMPT.format(
+            plan=plan,
+            metadata=metadata,
+            column_names=column_names,
+            clarifications=clarifications,
+            file_registry=json.dumps(file_registry, indent=2),
+            per_file_columns=per_file_columns,
+        )
+        caller = "generate_code_instructions"
+
     print("[STAGE] CODEGEN | [LLM CALL] Generating code instructions")
-    result = call_llm(prompt, caller="generate_code_instructions")
+    result = call_llm(prompt, caller=caller)
     print("[STAGE] CODEGEN | [FUNCTION] Code instructions generated")
     print("[FUNCTION] Exiting generate_code_instructions")
     return result
 
 
 def generate_code(instructions, metadata, file_registry: dict,
-                  sources: list = None, per_file_columns: str = None):
+                  sources: list = None, per_file_columns: str = None,
+                  clarification_answers: str = ""):
     """Generate executable Python code.
+
+    Routes to PDF_CODE_GENERATION_PROMPT when the sources include PDFs with
+    vision-detected columns; otherwise uses the generic CODE_GENERATION_PROMPT.
 
     file_registry: {alias -> absolute_path} for every available file.
     per_file_columns: pre-built column manifest (pass from orchestrator to avoid recomputing).
+    clarification_answers: the user's clarification answers string (passed through for PDF prompt).
     The LLM is instructed to emit  file_registry = __FILE_REGISTRY__
     as the first line — injected at execution time.
     """
     print("[FUNCTION] Entering generate_code")
-    column_names = _extract_column_names(metadata)
     if per_file_columns is None:
         per_file_columns = _build_per_file_columns(sources or [], file_registry)
-    prompt = CODE_GENERATION_PROMPT.format(
-        instructions=instructions,
-        metadata=metadata,
-        column_names=column_names,
-        file_registry=json.dumps(file_registry, indent=2),
-        per_file_columns=per_file_columns,
-    )
+
+    use_pdf_prompt = _has_pdf_vision_sources(sources or [])
+
+    if use_pdf_prompt:
+        print("[STAGE] CODEGEN | PDF vision sources detected — using PDF_CODE_GENERATION_PROMPT")
+        column_names = _runtime_column_names(sources or [], metadata)
+        prompt = PDF_CODE_GENERATION_PROMPT.format(
+            instructions=instructions,
+            per_file_columns=per_file_columns,
+            column_names=column_names,
+            file_registry=json.dumps(file_registry, indent=2),
+            clarification_answers=clarification_answers or "No clarification answers provided.",
+        )
+        caller = "generate_code[pdf]"
+    else:
+        column_names = _extract_column_names(metadata)
+        prompt = CODE_GENERATION_PROMPT.format(
+            instructions=instructions,
+            metadata=metadata,
+            column_names=column_names,
+            file_registry=json.dumps(file_registry, indent=2),
+            per_file_columns=per_file_columns,
+        )
+        caller = "generate_code"
+
     print("[STAGE] CODEGEN | [LLM CALL] Generating executable code")
-    result = call_llm(prompt, caller="generate_code")
+    result = call_llm(prompt, caller=caller)
     print(f"[STAGE] CODEGEN | [FUNCTION] Code generated | length={len(result)} chars")
     print("[FUNCTION] Exiting generate_code")
     return result
@@ -1232,11 +1484,17 @@ def summarize_execution_result(user_query: str, code: str, result_data) -> dict:
         return {
             "summary": parsed.get("summary", ""),
             "key_metrics": parsed.get("key_metrics", []),
+            "recommendation": parsed.get("recommendation", "save"),
+            "reason": parsed.get("reason", "This result looks useful, you can save this workflow.")
         }
 
     # Fallback: use raw response as summary
-    return {"summary": response.strip()[:500], "key_metrics": []}
-
+    return {
+        "summary": response.strip()[:500], 
+        "key_metrics": [],
+        "recommendation": "save",
+        "reason": "Execution completed."
+    }
 
 def generate_workflow_insights(
     code: str,
@@ -1297,3 +1555,184 @@ def adapt_workflow_code(original_code: str, column_mapping: dict) -> str:
     if code.endswith("```"):
         code = code[:-3].rstrip()
     return code.strip() or original_code
+
+
+def validate_data_readiness(plan_text: str, sources: list) -> dict:
+    """Cross-check the confirmed intent plan against actual uploaded columns.
+
+    Returns a dict:
+        required_fields:  list of {name, purpose, status, matched_column, file, is_blocking}
+        can_proceed:      bool — True when zero blocking fields are missing
+        blocking_issues:  list of issue strings
+        warnings:         list of non-blocking warning strings
+    """
+    print("[FUNCTION] Entering validate_data_readiness")
+    _fallback = {"required_fields": [], "can_proceed": True, "blocking_issues": [], "warnings": []}
+
+    if not sources:
+        return {
+            "required_fields": [],
+            "can_proceed": False,
+            "blocking_issues": ["No files have been uploaded yet. Please upload your data first."],
+            "warnings": [],
+        }
+
+    # Build per-file column listing
+    col_lines = []
+    for src in sources:
+        raw_cols = src.get("columns", [])
+        src_type = src.get("source_type", src.get("type", ""))
+
+        # Separate runtime (pdfplumber-extracted) columns from vision-detected-only columns.
+        # For non-PDF sources all columns are runtime columns.
+        runtime_cols = []
+        vision_only_cols = []
+        for c in raw_cols:
+            name = (c.get("name", "") if isinstance(c, dict) else str(c)).strip()
+            if not name:
+                continue
+            src_tag = c.get("column_source", "") if isinstance(c, dict) else ""
+            if src_tag == "vision":
+                vision_only_cols.append(name)
+            else:
+                runtime_cols.append(name)
+
+        if runtime_cols or vision_only_cols:
+            header = f"File: {src['name']} ({src['type'].upper()})"
+            parts = [header]
+            if runtime_cols:
+                parts.append(f"  Runtime columns (DataFrame-accessible via CSV): {', '.join(runtime_cols)}")
+            if vision_only_cols:
+                parts.append(
+                    f"  Vision-detected semantic fields (present in document; "
+                    f"NOT direct DataFrame columns — require text/regex extraction): "
+                    f"{', '.join(vision_only_cols)}"
+                )
+            col_lines.append("\n".join(parts))
+        elif src_type == "pdf":
+            # Unstructured PDF: no tables detected, but fitz guarantees a single
+            # 'text' column at runtime (one row per non-empty line of the document).
+            col_lines.append(
+                f"File: {src['name']} (PDF — UNSTRUCTURED)\n"
+                f"  Runtime columns: text\n"
+                f"  Note: No tabular structure found. All content is free-text rows in a 'text' column. "
+                f"Keyword filtering and regex extraction work on this column."
+            )
+        else:
+            col_lines.append(f"File: {src['name']} ({src['type'].upper()})\n  Columns: (none detected yet)")
+    columns_per_file = "\n\n".join(col_lines) or "No column information available."
+
+    prompt = DATA_READINESS_PROMPT.format(
+        plan_text=plan_text[:3000],        # cap to avoid giant prompts
+        columns_per_file=columns_per_file,
+    )
+    print("[STAGE] DATA READINESS | [LLM CALL] Validating required fields")
+    response = call_llm(prompt, caller="validate_data_readiness")
+    result = _parse_json(response, fallback=None)
+
+    if result is None or not isinstance(result, dict):
+        print("[FUNCTION] validate_data_readiness — could not parse JSON, returning fallback")
+        return _fallback
+
+    print(f"[FUNCTION] Exiting validate_data_readiness | can_proceed={result.get('can_proceed')}")
+    return result
+
+
+def generate_intent_clarifications(query: str, plan: str, sources: list, file_registry: dict) -> list:
+    """Generate targeted clarification questions after the user confirms the intent plan.
+
+    Covers three areas (in priority order):
+      1. File association — which file(s) to use (always asked when multiple files)
+      2. Column/field disambiguation — when multiple columns could satisfy a concept
+      3. Analytical parameters — thresholds, date ranges, groupings left unspecified
+
+    Returns a list of {key, question, options, type} dicts (may be empty if nothing is ambiguous).
+    """
+    print("[FUNCTION] Entering generate_intent_clarifications")
+    if not sources:
+        return []
+
+    # Build files + columns summary
+    file_lines = []
+    file_names = []
+    for src in sources:
+        name = src.get("name", "unknown")
+        file_names.append(name)
+        cols = [c.get("name", "") if isinstance(c, dict) else str(c) for c in src.get("columns", [])]
+        col_preview = ", ".join(cols[:30]) + ("..." if len(cols) > 30 else "")
+        file_lines.append(f"**{name}** ({src.get('type', 'file')}):\n  Columns: {col_preview}")
+
+    files_summary = "\n\n".join(file_lines) if file_lines else "No files uploaded."
+    file_list = ", ".join(file_names) if file_names else "none"
+    file_count = len(file_names)
+
+    prompt = INTENT_CLARIFICATION_PROMPT.format(
+        query=query,
+        plan=plan[:3000],
+        files_summary=files_summary,
+        file_list=file_list,
+        file_count=file_count,
+    )
+
+    print("[STAGE] INTENT CLARIFICATION | [LLM CALL] Generating targeted clarification questions")
+    response = call_llm(prompt, caller="generate_intent_clarifications")
+    result = _parse_json(response, fallback=None)
+
+    if result is None:
+        print("[FUNCTION] generate_intent_clarifications — could not parse JSON, returning []")
+        return []
+    if isinstance(result, list):
+        print(f"[FUNCTION] Exiting generate_intent_clarifications | questions={len(result)}")
+        return result
+    return []
+
+
+def stream_intent_plan(
+    query: str,
+    metadata: list,
+    sources: list,
+    previous_plan: str = "",
+    user_feedback: str = "",
+):
+    """Return a streaming generator of intent plan text chunks (for st.write_stream).
+
+    Builds a structured audit execution plan showing the user what we understood,
+    what data we need, and how we'll approach the analysis — before any code runs.
+    """
+    from vertex_client import stream_llm
+
+    # Build files + columns summary
+    if sources:
+        file_lines = []
+        for src in sources:
+            cols = [c.get("name", "") if isinstance(c, dict) else str(c) for c in src.get("columns", [])]
+            col_preview = ", ".join(cols[:25]) + ("..." if len(cols) > 25 else "")
+            file_lines.append(
+                f"- **{src['name']}** ({src['type'].upper()}): {col_preview or 'no columns detected'}"
+            )
+        files_summary = "\n".join(file_lines)
+    else:
+        files_summary = "No files uploaded yet."
+
+    # Build feedback/refinement section
+    if user_feedback:
+        feedback_section = (
+            f"USER FEEDBACK ON PREVIOUS PLAN:\n{user_feedback}\n\n"
+            f"PREVIOUS PLAN (for reference):\n{previous_plan}\n\n"
+            f"Revise the plan to address the user's feedback. Keep what was good, change what they asked."
+        )
+    elif previous_plan:
+        feedback_section = (
+            f"PREVIOUS PLAN:\n{previous_plan}\n\n"
+            f"The user wants a completely different approach. Generate an alternative strategy."
+        )
+    else:
+        feedback_section = ""
+
+    prompt = INTENT_PLANNING_PROMPT.format(
+        query=query,
+        files_summary=files_summary,
+        feedback_section=feedback_section,
+    )
+    print(f"[INTENT PLAN] Streaming plan for query: {query[:80]}...")
+    return stream_llm(prompt, caller="stream_intent_plan")
