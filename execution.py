@@ -552,6 +552,58 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
         except ImportError:
             pass
 
+        # ── _resolve_pdf_path — transparent S3/HTTPS → local path resolver ──
+        def _resolve_pdf_path(path):
+            """Return a guaranteed-local file path for the given path.
+
+            If path is already a local file → returned as-is.
+            If path is an HTTPS URL (e.g. S3 presigned URL) → streamed to a
+            temp file and the temp path is returned.
+            If path is an s3:// URI → downloaded via boto3 to a temp file.
+
+            This is a safety net: the normal flow always stores a local copy
+            at upload time, so this branch should rarely be hit.
+            """
+            import os as _os
+            if not path:
+                return path
+            # Already a local path that exists
+            if _os.path.exists(path):
+                return path
+            # HTTPS presigned URL
+            if path.startswith("https://") or path.startswith("http://"):
+                try:
+                    import requests as _req, tempfile as _tmp
+                    _r = _req.get(path, stream=True, timeout=120)
+                    _r.raise_for_status()
+                    _tf = _tmp.NamedTemporaryFile(suffix=".pdf", delete=False)
+                    for _chunk in _r.iter_content(chunk_size=65536):
+                        if _chunk:
+                            _tf.write(_chunk)
+                    _tf.close()
+                    print(f"[_resolve_pdf_path] Downloaded HTTPS → {_tf.name}")
+                    return _tf.name
+                except Exception as _e:
+                    raise ValueError(f"_resolve_pdf_path: failed to download '{path}': {_e}")
+            # s3://bucket/key
+            if path.startswith("s3://"):
+                try:
+                    import boto3 as _boto3, tempfile as _tmp
+                    _parts = path[5:].split("/", 1)
+                    _bucket, _key = _parts[0], _parts[1]
+                    _tf = _tmp.NamedTemporaryFile(suffix=".pdf", delete=False)
+                    _tf.close()
+                    _boto3.client("s3").download_file(_bucket, _key, _tf.name)
+                    print(f"[_resolve_pdf_path] Downloaded s3://{_bucket}/{_key} → {_tf.name}")
+                    return _tf.name
+                except ImportError:
+                    raise ValueError("_resolve_pdf_path: boto3 not installed. Cannot resolve s3:// path.")
+                except Exception as _e:
+                    raise ValueError(f"_resolve_pdf_path: failed to download '{path}': {_e}")
+            return path  # unknown scheme — pass through, let the caller error naturally
+
+        _ns["_resolve_pdf_path"] = _resolve_pdf_path
+
         # ── load_pdf_data — pre-loaded helper for generated code ──────────────
         def load_pdf_data(path):
             """Load any PDF (or pre-extracted CSV) into a clean pandas DataFrame.
@@ -563,6 +615,7 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
               4. Empty-DataFrame safety net
             """
             import os as _os
+            path = _resolve_pdf_path(path)  # transparent S3/HTTPS → local
             # ── Case 1: already converted to CSV ─────────────────────────────
             if path.lower().endswith(".csv"):
                 try:
@@ -635,6 +688,7 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
             Returns the complete text as a single string.
             Raises ValueError if the file cannot be read.
             """
+            path = _resolve_pdf_path(path)  # transparent S3/HTTPS → local
             if not path or not os.path.exists(path):
                 raise ValueError(
                     f"extract_pdf_text: file not found at path '{path}'. "
@@ -678,6 +732,7 @@ def _write_repl_driver(driver_path: str, manifest_path: str):
             Use this to build line_items_df for the dual-table audit model.
             If no structured tables are found the DataFrame will be empty — check with df.empty.
             """
+            path = _resolve_pdf_path(path)  # transparent S3/HTTPS → local
             if not path or not os.path.exists(path):
                 raise ValueError(
                     f"load_pdf_tables_with_pages: file not found at '{path}'. "

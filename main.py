@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, HTTPException, File
 from typing import List
 from concurrent.futures import ThreadPoolExecutor
 from models import WorkflowSaveRequest, WorkflowRunRequest
-from orchestrator import handle_query_v2
+from orchestrator import handle_agentic_turn as handle_query_v2
 from workflow import save_workflow, fetch_workflows, get_workflow
 from execution import execute_code
 from agents import extract_workflow_semantics, map_fields
@@ -181,13 +181,99 @@ def connect_sql_source(config: dict):
         raise HTTPException(status_code=500, detail=f"SQL connection failed: {str(e)}")
 
 
+# ── S3 PDF Upload Endpoint ───────────────────────────────
+
+@app.post("/upload/s3")
+def upload_from_s3(body: dict):
+    """
+    Register a PDF that was uploaded to S3 by the frontend.
+
+    Accepts either:
+      {"s3_url": "https://presigned-url..."}              — HTTPS presigned URL (recommended)
+      {"bucket": "my-bucket", "key": "path/file.pdf"}    — direct S3 access via boto3 (needs AWS creds)
+
+    Downloads the PDF locally via streaming (64 KB chunks — safe for large files),
+    then runs the exact same metadata extraction and orchestration as a normal /upload.
+    The file_registry stores the local path — the orchestrator and all downstream
+    agents are completely unaware that the file originated from S3.
+    """
+    s3_url = body.get("s3_url", "").strip()
+    bucket = body.get("bucket", "").strip()
+    key    = body.get("key", "").strip()
+
+    if not s3_url and not (bucket and key):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 's3_url' (presigned HTTPS URL) or both 'bucket' and 'key'."
+        )
+
+    upload_dir = os.path.join(_BASE_DIR, "uploads")
+    file_id    = str(uuid.uuid4())
+    local_path = os.path.join(upload_dir, f"{file_id}.pdf")
+
+    if s3_url:
+        orig_name = _stream_download_url(s3_url, local_path)
+    else:
+        orig_name = _stream_download_s3(bucket, key, local_path)
+
+    if not orig_name:
+        # Clean up partial file if it exists
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        raise HTTPException(status_code=400, detail="Failed to download PDF from S3. Check the URL/credentials.")
+
+    register_file(file_id, orig_name, local_path, source="s3")
+    extracted = _extract_metadata("pdf", local_path)
+
+    return {
+        "source_id":    file_id,
+        "local_path":   local_path,
+        "s3_source":    s3_url or f"s3://{bucket}/{key}",
+        "original_name": orig_name,
+        "metadata":     extracted.get("columns", []),
+        "data_summary": extracted.get("data_summary", {}),
+        "edge_cases":   extracted.get("edge_cases", {}),
+        "type":         "pdf",
+        "status":       "COMPLETED",
+    }
+
+
 # ── Orchestration Endpoint ───────────────────────────────
 
 @app.post("/orchestrate")
 def orchestrate_step(context: dict):
-    """Main orchestration endpoint — deterministic state machine."""
+    """Main orchestration endpoint — deterministic state machine.
+
+    Accepts new-style context (with 'query' or 'user_query' key) and normalises
+    legacy keys so the orchestrator always receives the shape it expects.
+    """
     try:
-        return handle_query_v2(context)
+        # Extract query — support both key names
+        query = context.get("query") or context.get("user_query") or ""
+
+        # Normalise clarification_state from old flat keys if not already present
+        if "clarification_state" not in context:
+            context["clarification_state"] = {
+                "answers": context.get("clarifications", {}),
+                "attempt_count": context.get("clarification_attempt_count", 0),
+                "questions": context.get("previous_clarification_questions", []),
+            }
+
+        # Normalise file_registry from legacy file_path if not already present
+        if "file_registry" not in context and context.get("file_path"):
+            context["file_registry"] = {"default": context["file_path"]}
+
+        # Normalise sources list from legacy metadata if not already present
+        if "sources" not in context and context.get("metadata"):
+            context["sources"] = [{
+                "name": "uploaded_file",
+                "columns": context["metadata"],
+                "source_type": context.get("type", "csv"),
+                "data_summary": {},
+                "edge_cases": {},
+            }]
+
+        return handle_query_v2(query=query, context=context)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -330,6 +416,51 @@ def download_external_file(url: str, upload_dir: str):
     except Exception as e:
         print(f"Failed to download URL: {e}")
         return None, None, None
+
+def _stream_download_url(url: str, local_path: str) -> str | None:
+    """Stream-download a file from a presigned HTTPS URL to local_path.
+
+    Uses 64 KB chunks — never holds the full file in memory.
+    Returns the filename string on success, None on failure.
+    """
+    try:
+        response = requests.get(url, stream=True, timeout=120)
+        response.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+        filename = os.path.basename(urlparse(url).path) or "s3_upload.pdf"
+        if not filename.lower().endswith(".pdf"):
+            filename = "s3_upload.pdf"
+        return filename
+    except Exception as e:
+        print(f"[S3] _stream_download_url failed: {e}")
+        return None
+
+
+def _stream_download_s3(bucket: str, key: str, local_path: str) -> str | None:
+    """Download a file from S3 using boto3 (requires AWS credentials in the environment).
+
+    Falls back to a clear error if boto3 is not installed — in that case the
+    frontend should send a presigned URL via s3_url instead.
+    Returns the filename string on success, None on failure.
+    """
+    try:
+        import boto3  # optional dependency
+        s3_client = boto3.client("s3")
+        s3_client.download_file(bucket, key, local_path)
+        return os.path.basename(key) or "s3_upload.pdf"
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="boto3 is not installed. Cannot download directly from S3. "
+                   "Use 's3_url' with a presigned HTTPS URL instead."
+        )
+    except Exception as e:
+        print(f"[S3] _stream_download_s3 failed: {e}")
+        return None
+
 
 def _extract_metadata(ext: str, local_path: str):
     """Extract metadata based on file type. Returns standardized format for ALL types.
